@@ -2106,8 +2106,8 @@ void rd_kafka_conf_set_rebalance_cb(
  * rd_kafka_assignor_complete() from any thread. No heartbeat is sent while
  * the assignment is pending, so it must complete within `session.timeout.ms`
  * of the JoinGroup response (the other members' SyncGroup waits that long
- * too); a heartbeat interval before that the library gives the assignment up
- * and rejoins.
+ * too); `heartbeat.interval.ms` before that the library gives the assignment
+ * up and rejoins (rd_kafka_new() requires the interval to be the shorter).
  *
  * Under the COOPERATIVE protocol the post-assignment adjustment the built-in
  * assignors rely on is not applied to an application assignor: the assignor
@@ -2154,12 +2154,16 @@ typedef enum rd_kafka_assignor_protocol_t {
 /**
  * @brief Produces the userdata this member puts into its JoinGroup metadata.
  *
- * @param topics The subscribed topic names.
+ * @param rk The client.
+ * @param topics The subscribed topic names; valid during the call only.
+ * @param topic_cnt The number of topics.
  * @param owned_partitions The partitions this member owns going into the
- *        rebalance, or NULL.
+ *        rebalance, or NULL; valid during the call only.
  * @param userdata Set to a buffer allocated with rd_kafka_mem_malloc(), or
  *        left NULL for no userdata; the library frees it.
- * @param userdata_size Set to the buffer's size.
+ * @param userdata_size Set to the buffer's size, at most INT32_MAX (the
+ *        library aborts on more).
+ * @param opaque The opaque given to rd_kafka_conf_set_assignor().
  */
 typedef void (*rd_kafka_assignor_subscription_cb_t)(
     rd_kafka_t *rk,
@@ -2176,7 +2180,9 @@ typedef void (*rd_kafka_assignor_subscription_cb_t)(
  * @param rk The client.
  * @param member_id This client's own member id; valid during the call only.
  * @param metadata Cluster metadata for the subscribed topics, never NULL;
- *        valid during the call only.
+ *        valid during the call only. It is the metadata as received: a
+ *        topic may carry an error in \c topics[i].err or no partitions, and
+ *        `topic.blacklist` is not applied to it.
  * @param members The group's members, read through
  *        rd_kafka_assignor_member_at() and the accessors below, written
  *        through rd_kafka_assignor_member_set_assignment() and
@@ -2209,9 +2215,14 @@ typedef rd_kafka_assignor_result_t (*rd_kafka_assignor_assign_cb_t)(
  * @brief Receives the partitions and userdata the leader assigned to this
  *        member, before the assignment is applied.
  *
- * @param userdata The assigned userdata, or NULL with size 0.
+ * @param rk The client.
+ * @param assignment The assigned partitions; valid during the call only.
+ * @param userdata The assigned userdata, or NULL with size 0; valid during
+ *        the call only.
+ * @param userdata_size The userdata's size.
  * @param group_metadata Group id, generation, member id and group instance
- *        id of this member, valid during the call.
+ *        id of this member; valid during the call only.
+ * @param opaque The opaque given to rd_kafka_conf_set_assignor().
  */
 typedef void (*rd_kafka_assignor_on_assignment_cb_t)(
     rd_kafka_t *rk,
@@ -2226,13 +2237,18 @@ typedef void (*rd_kafka_assignor_on_assignment_cb_t)(
  *
  * The assignor is created with the client and selected through
  * `partition.assignment.strategy`, whose value must then name it (alone, or
- * alongside built-in assignors of the same \p protocol). rd_kafka_new() fails
- * when \p protocol_name is a built-in assignor's name. The registration is
- * copied by rd_kafka_conf_dup(); a second call replaces the first.
+ * alongside built-in assignors of the same \p protocol); a registration the
+ * strategy does not name is unused. rd_kafka_new() fails when
+ * \p protocol_name is empty, contains a comma or whitespace, or is a
+ * built-in assignor's name, when \p protocol is not one of the enum's
+ * values, or when `heartbeat.interval.ms` is not less than
+ * `session.timeout.ms`. The registration is copied by rd_kafka_conf_dup();
+ * a second call replaces the first.
  *
- * @param protocol_name The assignor's name, not NULL.
- * @param assign_cb Required.
+ * @param protocol_name The assignor's name; the library aborts on NULL.
+ * @param protocol The rebalance protocol the assignor speaks.
  * @param subscription_cb May be NULL: no userdata is sent.
+ * @param assign_cb Required; the library aborts on NULL.
  * @param on_assignment_cb May be NULL.
  * @param opaque Passed to every callback; must outlive the client.
  *
@@ -2255,19 +2271,23 @@ rd_kafka_assignor_member_at(rd_kafka_assignor_member_t *members, size_t idx);
 
 /** @returns the member's id. */
 RD_EXPORT
-const char *rd_kafka_assignor_member_id(const rd_kafka_assignor_member_t *member);
+const char *
+rd_kafka_assignor_member_id(const rd_kafka_assignor_member_t *member);
 
-/** @returns the member's group instance id, or NULL when it has none. */
+/** @returns the member's group instance id, or NULL when it has none (an
+ *           empty one counts as none). */
 RD_EXPORT
 const char *rd_kafka_assignor_member_group_instance_id(
     const rd_kafka_assignor_member_t *member);
 
-/** @returns the member's rack id, or NULL when it reported none. */
+/** @returns the member's rack id, or NULL when it reported none (an empty
+ *           one counts as none). */
 RD_EXPORT
 const char *
 rd_kafka_assignor_member_rack_id(const rd_kafka_assignor_member_t *member);
 
-/** @returns the member's subscribed topics (partition unset). */
+/** @returns the member's subscribed topics, one element per topic with
+ *           the partition RD_KAFKA_PARTITION_UA. */
 RD_EXPORT
 const rd_kafka_topic_partition_list_t *
 rd_kafka_assignor_member_subscription(const rd_kafka_assignor_member_t *member);
@@ -2276,7 +2296,8 @@ rd_kafka_assignor_member_subscription(const rd_kafka_assignor_member_t *member);
  *           empty list when it owns none), or NULL for a member whose
  *           subscription metadata predates owned partitions. */
 RD_EXPORT
-const rd_kafka_topic_partition_list_t *rd_kafka_assignor_member_owned_partitions(
+const rd_kafka_topic_partition_list_t *
+rd_kafka_assignor_member_owned_partitions(
     const rd_kafka_assignor_member_t *member);
 
 /** @returns the userdata the member's subscription carried, or NULL with
@@ -2286,14 +2307,16 @@ const void *
 rd_kafka_assignor_member_userdata(const rd_kafka_assignor_member_t *member,
                                   size_t *sizep);
 
-/** @brief Sets the partitions assigned to the member (copied). */
+/** @brief Sets the partitions assigned to the member (topic and partition
+ *         are copied, nothing else); NULL means none. */
 RD_EXPORT
 void rd_kafka_assignor_member_set_assignment(
     rd_kafka_assignor_member_t *member,
     const rd_kafka_topic_partition_list_t *assignment);
 
 /** @brief Sets the userdata assigned to the member (copied; at most
- *         INT32_MAX bytes). */
+ *         INT32_MAX bytes, the library aborts on more); NULL or a size of 0
+ *         means none. */
 RD_EXPORT
 void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
                                            const void *userdata,
@@ -2306,15 +2329,15 @@ void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
  * consumed. With \p err RD_KAFKA_RESP_ERR_NO_ERROR the members' assignments
  * and userdata are sent to the group; otherwise the group rejoins and
  * \p errstr is logged. A completion that arrives after the group rejoined,
- * unsubscribed, picked another assignor, gave the assignment up at
- * `session.timeout.ms` or was destroyed is dropped: the handle is released
- * and nothing else is touched, so completing after rd_kafka_destroy() is
- * safe. A handle that is never completed leaks the handle and the members it
- * holds.
+ * unsubscribed, picked another assignor, gave the assignment up
+ * (`session.timeout.ms` less `heartbeat.interval.ms` after the JoinGroup
+ * response) or was destroyed is dropped: the handle is released and nothing
+ * else is touched, so completing after rd_kafka_destroy() is safe. A handle
+ * that is never completed leaks the handle and the members it holds.
  *
  * @param pending The handle from the assign callback.
  * @param err RD_KAFKA_RESP_ERR_NO_ERROR, or why the assignment failed.
- * @param errstr The reason, or NULL.
+ * @param errstr The reason, or NULL; copied.
  */
 RD_EXPORT
 void rd_kafka_assignor_complete(rd_kafka_assignor_pending_t *pending,

@@ -59,6 +59,18 @@ int main_0006_symbols(int argc, char **argv) {
                 rd_kafka_conf_set_log_cb(NULL, NULL);
                 rd_kafka_conf_set_socket_cb(NULL, NULL);
                 rd_kafka_conf_set_rebalance_cb(NULL, NULL);
+                rd_kafka_conf_set_assignor(NULL, NULL, 0, NULL, NULL, NULL,
+                                           NULL);
+                rd_kafka_assignor_member_at(NULL, 0);
+                rd_kafka_assignor_member_id(NULL);
+                rd_kafka_assignor_member_group_instance_id(NULL);
+                rd_kafka_assignor_member_rack_id(NULL);
+                rd_kafka_assignor_member_subscription(NULL);
+                rd_kafka_assignor_member_owned_partitions(NULL);
+                rd_kafka_assignor_member_userdata(NULL, NULL);
+                rd_kafka_assignor_member_set_assignment(NULL, NULL);
+                rd_kafka_assignor_member_set_userdata(NULL, NULL, 0);
+                rd_kafka_assignor_complete(NULL, 0, NULL);
                 rd_kafka_conf_set_offset_commit_cb(NULL, NULL);
                 rd_kafka_conf_set_throttle_cb(NULL, NULL);
                 rd_kafka_conf_set_default_topic_conf(NULL, NULL);
