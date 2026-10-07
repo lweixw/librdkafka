@@ -220,6 +220,9 @@ typedef enum {
         RD_KAFKA_OP_SHARE_SESSION_CLEAR, /**< broker op: Enqueued by main thread
                                             to clear share session during broker
                                             decommission */
+        RD_KAFKA_OP_ASSIGNOR_COMPLETE,    /**< Application assignor finished a
+                                           *   pending assignment:
+                                           *   u.assignor_complete */
         RD_KAFKA_OP__END
 } rd_kafka_op_type_t;
 
@@ -912,6 +915,17 @@ struct rd_kafka_op_s {
                         rd_bool_t
                             registered; /**< true=register, false=unregister */
                 } share_ack_commit_cb_register;
+
+                struct {
+                        /** The pending assignment this completes, compared
+                         *  (never dereferenced) against the cgrp's current
+                         *  one. */
+                        struct rd_kafka_assignor_pending_s *pending;
+                        /** The assignor's result. */
+                        rd_kafka_resp_err_t err;
+                        /** Allocated reason, or NULL. */
+                        char *errstr;
+                } assignor_complete;
 
         } rko_u;
 };
