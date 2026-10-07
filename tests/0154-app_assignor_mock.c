@@ -55,10 +55,15 @@
  *  - close during pending: the leader is closed and destroyed while its
  *    assignment is pending and the handle completes afterwards: the members
  *    behind the handle stay valid and the completion is a safe no-op;
- *  - join during pending: a member joins under a pending assignment;
+ *  - join during pending: a member joins under a pending assignment, so
+ *    the coordinator refuses that assignment's SyncGroup and the leader
+ *    assigns again for three;
  *  - timeout: a pending assignment is not completed within
- *    session.timeout.ms: the library gives it up and rejoins, the late
- *    completion is dropped;
+ *    session.timeout.ms of the JoinGroup response: the library gives it up
+ *    and rejoins before the coordinator evicts the leader (which stays
+ *    leader), and the late completion is dropped;
+ *  - duplicate: an assignment that hands one partition to two members is
+ *    rejected and the group rejoins;
  *  - fail sync / fail async: the leader fails one assignment, synchronously
  *    or through rd_kafka_assignor_complete(err), and the group rejoins;
  *  - violation: an assignment that moves an owned partition directly is
@@ -94,12 +99,18 @@ enum mode {
         MODE_FAIL_SYNC,
         MODE_FAIL_ASYNC,
         MODE_VIOLATION,
+        MODE_DUPLICATE,
         MODE_EAGER,
 };
+
+#define MAX_CALLS 16
 
 static struct {
         enum mode mode;
         int assign_calls;
+        /** Per assign call: the member count and the leader's member id. */
+        int call_members[MAX_CALLS];
+        char call_leader[MAX_CALLS][128];
         /** The member id of the leader that ran the last assign call. */
         char leader_id[128];
         /** Member count of the violating assign call. */
@@ -176,7 +187,7 @@ static void assign_members(rd_kafka_assignor_member_t *members,
 
         mtx_lock(&lock);
         mode    = scn.mode;
-        violate = mode == MODE_VIOLATION &&
+        violate = (mode == MODE_VIOLATION || mode == MODE_DUPLICATE) &&
                   call == scn.first_three_member_call;
         mtx_unlock(&lock);
 
@@ -249,12 +260,18 @@ static void assign_members(rd_kafka_assignor_member_t *members,
                          * withheld (Streams' way), except once in the
                          * violation scenario, where it is moved outright
                          * and the library must refuse the assignment. */
-                        if (owner != member_cnt && owner != i && !violate)
+                        if (owner != member_cnt && owner != i &&
+                            !(violate && mode == MODE_VIOLATION))
                                 continue;
 
                         rd_kafka_topic_partition_list_add(assignment, TOPIC,
                                                           p);
                 }
+
+                /* The duplicate scenario hands p0 to every member once. */
+                if (violate && mode == MODE_DUPLICATE && i > 0)
+                        rd_kafka_topic_partition_list_add(assignment, TOPIC,
+                                                          0);
 
                 /* An empty assignment through NULL, the others as lists. */
                 rd_kafka_assignor_member_set_assignment(
@@ -284,23 +301,22 @@ static int pending_thread(void *arg) {
 
         mtx_lock(&lock);
         mode = scn.mode;
-        scn.threads++;
-        mtx_unlock(&lock);
-
-        rd_usleep(300 * 1000, NULL);
-        assign_members(job->members, job->member_cnt, job->call);
-
-        mtx_lock(&lock);
         if (mode == MODE_FAIL_ASYNC && job->call == scn.first_three_member_call)
                 err = RD_KAFKA_RESP_ERR__FAIL;
         mtx_unlock(&lock);
 
+        rd_usleep(300 * 1000, NULL);
+
         /* Scenarios that act on the group under the pending assignment
-         * release the thread once they are done. */
+         * release the thread once they are done; the members are written
+         * only after that, so that they are written into an abandoned
+         * assignment whenever the scenario abandoned it. */
         mtx_lock(&lock);
         while (scn.hold_completion)
                 cnd_wait(&cnd, &lock);
         mtx_unlock(&lock);
+
+        assign_members(job->members, job->member_cnt, job->call);
 
         rd_kafka_assignor_complete(job->pending, err,
                                    err ? "failed on purpose" : NULL);
@@ -333,6 +349,10 @@ assign_cb(rd_kafka_t *rk,
         mtx_lock(&lock);
         mode = scn.mode;
         call = ++scn.assign_calls;
+        TEST_ASSERT(call < MAX_CALLS, "too many assign calls");
+        scn.call_members[call] = (int)member_cnt;
+        rd_snprintf(scn.call_leader[call], sizeof(scn.call_leader[call]), "%s",
+                    member_id);
         if (member_cnt == C_CNT && !scn.first_three_member_call)
                 scn.first_three_member_call = call;
         fail_sync = mode == MODE_FAIL_SYNC &&
@@ -364,6 +384,9 @@ assign_cb(rd_kafka_t *rk,
                 job->members    = members;
                 job->member_cnt = member_cnt;
                 job->call       = call;
+                mtx_lock(&lock);
+                scn.threads++;
+                mtx_unlock(&lock);
                 TEST_ASSERT(thrd_create(&thrd, pending_thread, job) ==
                                 thrd_success,
                             "thrd_create failed");
@@ -543,7 +566,7 @@ static const char *mode_name(enum mode mode) {
             "done",         "untouched member", "pending",
             "close during pending", "join during pending", "timeout",
             "fail sync",    "fail async",       "violation",
-            "eager",
+            "duplicate",    "eager",
         };
         return names[mode];
 }
@@ -581,7 +604,9 @@ static void do_test(enum mode mode) {
         test_conf_init(&conf, NULL, 90);
         test_conf_set(conf, "bootstrap.servers", bootstraps);
         test_conf_set(conf, "partition.assignment.strategy", "stream");
-        test_conf_set(conf, "session.timeout.ms", "3000");
+        /* test_create_consumer() sets session.timeout.ms to 6000; the mock
+         * coordinator waits session.timeout - 1s for a rebalance's members
+         * and evicts a silent member at the session timeout. */
         test_conf_set(conf, "heartbeat.interval.ms", "500");
 
         for (i = 0; i < C_CNT; i++) {
@@ -630,16 +655,26 @@ static void do_test(enum mode mode) {
         }
 
         if (mode == MODE_TIMEOUT) {
-                /* The first assignment is held past session.timeout.ms
-                 * (3s): the library gives it up and rejoins, the next
-                 * assignment completes, and the late completion of the
-                 * first is dropped. */
+                /* The first assignment is held: a heartbeat interval before
+                 * the session would expire the library gives it up and
+                 * rejoins, before the coordinator evicts the leader, so the
+                 * same member leads the next assignment; the late completion
+                 * of the first is dropped. */
                 mtx_lock(&lock);
                 scn.hold_completion = rd_true;
                 mtx_unlock(&lock);
                 await_assign_calls(1);
-                rd_usleep(4000 * 1000, NULL);
                 await_assign_calls(2);
+                mtx_lock(&lock);
+                TEST_ASSERT(!strcmp(scn.call_leader[1], scn.call_leader[2]),
+                            "expected the same leader after the timeout, "
+                            "got %s then %s",
+                            scn.call_leader[1], scn.call_leader[2]);
+                TEST_ASSERT(scn.call_members[2] >= scn.call_members[1],
+                            "expected call 2 to see at least call 1's %d "
+                            "member(s), saw %d",
+                            scn.call_members[1], scn.call_members[2]);
+                mtx_unlock(&lock);
                 release_pending_threads();
                 await_assignments(c, 2, round1, "round 1 after a timeout");
                 check_userdata(c, 2);
@@ -648,8 +683,8 @@ static void do_test(enum mode mode) {
 
         if (mode == MODE_JOIN_DURING_PENDING) {
                 /* A member joins under the first (held) assignment; once
-                 * released, that completion's SyncGroup is stale and the
-                 * leader reassigns for three members. */
+                 * released, the coordinator refuses that completion's
+                 * SyncGroup and the leader reassigns for three members. */
                 mtx_lock(&lock);
                 scn.hold_completion = rd_true;
                 mtx_unlock(&lock);
@@ -685,16 +720,17 @@ static void do_test(enum mode mode) {
         TEST_ASSERT(scn.seen_cnt == 3 && !strcmp(scn.seen[2], "none"),
                     "leader saw %d subscription userdata, third \"%s\"",
                     scn.seen_cnt, scn.seen[2]);
-        if (mode == MODE_VIOLATION)
-                TEST_ASSERT(scn.violation_members == 3 && scn.assign_calls >= 3,
-                            "expected the violating 3-member assignment to be "
-                            "rejected and rerun, saw %d members, %d calls",
-                            scn.violation_members, scn.assign_calls);
-        if (mode == MODE_FAIL_SYNC || mode == MODE_FAIL_ASYNC)
-                TEST_ASSERT(scn.assign_calls >= 3,
-                            "expected the failed assignment to be rerun, "
-                            "saw %d calls",
-                            scn.assign_calls);
+        if (mode == MODE_VIOLATION || mode == MODE_DUPLICATE)
+                TEST_ASSERT(scn.violation_members == 3,
+                            "expected the violating call to see 3 members, "
+                            "saw %d",
+                            scn.violation_members);
+        if (mode == MODE_VIOLATION || mode == MODE_DUPLICATE ||
+            mode == MODE_FAIL_SYNC || mode == MODE_FAIL_ASYNC)
+                TEST_ASSERT(scn.assign_calls > scn.first_three_member_call,
+                            "expected the rejected or failed 3-member "
+                            "assignment (call %d) to be rerun, saw %d calls",
+                            scn.first_three_member_call, scn.assign_calls);
         mtx_unlock(&lock);
 
         if (mode == MODE_EAGER)
@@ -706,13 +742,16 @@ static void do_test(enum mode mode) {
         check_userdata(c, C_CNT);
 
 done:
-        release_pending_threads();
         for (i = 0; i < C_CNT; i++) {
                 if (!c[i].rk)
                         continue;
                 test_consumer_close(c[i].rk);
                 rd_kafka_destroy(c[i].rk);
         }
+        /* Threads spawned by the closing rebalances complete after their
+         * client is gone, which must be a no-op; wait for them before the
+         * scenario state is reused. */
+        release_pending_threads();
 
         test_mock_cluster_destroy(mcluster);
 

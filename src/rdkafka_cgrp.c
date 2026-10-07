@@ -1538,7 +1538,7 @@ rd_kafka_cgrp_consumer_rejoin(rd_kafka_cgrp_t *rkcg, const char *fmt, ...) {
  * @brief Rejoin the group.
  *
  * @remark This function must not have any side-effects but setting the
- *         join state.
+ *         join state (which gives up a pending application assignment).
  */
 static void rd_kafka_cgrp_rejoin(rd_kafka_cgrp_t *rkcg, const char *fmt, ...)
     RD_FORMAT(printf, 2, 3);
@@ -2131,14 +2131,21 @@ static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
         if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
                 /* The application assignor completes later through
                  * rd_kafka_assignor_complete(); the members stay on
-                 * rkcg_group_leader until then. The followers' SyncGroup
-                 * waits session.timeout.ms for the assignment, so that is
-                 * the bound, enforced here with a rejoin. */
+                 * rkcg_group_leader until then. No heartbeat is sent in
+                 * this state, so the coordinator's session clock runs from
+                 * the JoinGroup response: give the assignment up a
+                 * heartbeat interval before it would expire, with a
+                 * rejoin. */
+                rd_ts_t budget =
+                    ((rd_ts_t)rkcg->rkcg_rk->rk_conf.group_session_timeout_ms -
+                     (rd_ts_t)rkcg->rkcg_rk->rk_conf.group_heartbeat_intvl_ms) *
+                    1000;
+                rd_ts_t remaining =
+                    budget - (rd_clock() - rkcg->rkcg_ts_join_response);
                 rd_kafka_timer_start_oneshot(
                     &rkcg->rkcg_rk->rk_timers,
                     &rkcg->rkcg_assignor_pending_tmr, rd_true /*restart*/,
-                    (rd_ts_t)rkcg->rkcg_rk->rk_conf.group_session_timeout_ms *
-                        1000,
+                    remaining > 1000 ? remaining : 1000,
                     rd_kafka_cgrp_assignor_pending_tmr_cb, rkcg);
                 rd_kafka_dbg(rkcg->rkcg_rk, CGRP | RD_KAFKA_DBG_CONSUMER,
                              "ASSIGNOR",
@@ -2172,8 +2179,8 @@ static void rd_kafka_cgrp_assignor_pending_tmr_cb(rd_kafka_timers_t *rkts,
 
         rd_kafka_log(rkcg->rkcg_rk, LOG_WARNING, "ASSIGNOR",
                      "Group \"%s\": application assignor did not complete "
-                     "the assignment within session.timeout.ms (%dms): "
-                     "rejoining group",
+                     "the assignment within session.timeout.ms (%dms) of "
+                     "the JoinGroup response: rejoining group",
                      rkcg->rkcg_group_id->str,
                      rkcg->rkcg_rk->rk_conf.group_session_timeout_ms);
 
@@ -2475,7 +2482,8 @@ static void rd_kafka_cgrp_handle_JoinGroup(rd_kafka_t *rk,
                             rkcg->rkcg_assignor_state);
                 rkcg->rkcg_assignor_state = NULL;
         }
-        rkcg->rkcg_assignor = rkas;
+        rkcg->rkcg_assignor         = rkas;
+        rkcg->rkcg_ts_join_response = rd_clock();
 
         if (i_am_leader) {
                 rd_kafka_group_member_t *members;

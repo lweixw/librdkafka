@@ -207,6 +207,10 @@ typedef struct rd_kafka_cgrp_s {
         rd_kafka_timer_t rkcg_assignor_pending_tmr; /**< Bounds a pending
                                                      *   assignment by
                                                      *   session.timeout.ms */
+        rd_ts_t rkcg_ts_join_response; /**< When the last JoinGroup response
+                                        *   was handled: the coordinator's
+                                        *   session clock for the sync phase
+                                        *   runs from there. */
 
         int32_t rkcg_coord_id; /**< Current coordinator id,
                                 *   or -1 if not known. */
