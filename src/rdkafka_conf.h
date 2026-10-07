@@ -196,7 +196,7 @@ typedef enum {
 
 /* Increase in steps of 64 as needed.
  * This must be larger than sizeof(rd_kafka_[topic_]conf_t) */
-#define RD_KAFKA_CONF_PROPS_IDX_MAX (64 * 35)
+#define RD_KAFKA_CONF_PROPS_IDX_MAX (64 * 36)
 
 /**
  * @struct rd_kafka_anyconf_t
@@ -451,6 +451,17 @@ struct rd_kafka_conf_s {
         char *partition_assignment_strategy;
         rd_list_t partition_assignors;
         int enabled_assignor_cnt;
+
+        /** Application assignor registered with rd_kafka_conf_set_assignor();
+         *  registered by rd_kafka_assignors_init() when assign_cb is set. */
+        struct {
+                char *protocol_name;
+                rd_kafka_assignor_protocol_t protocol;
+                rd_kafka_assignor_subscription_cb_t subscription_cb;
+                rd_kafka_assignor_assign_cb_t assign_cb;
+                rd_kafka_assignor_on_assignment_cb_t on_assignment_cb;
+                void *opaque;
+        } app_assignor;
 
         void (*rebalance_cb)(rd_kafka_t *rk,
                              rd_kafka_resp_err_t err,

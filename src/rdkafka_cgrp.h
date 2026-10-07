@@ -97,6 +97,10 @@ typedef struct rd_kafka_cgrp_s {
                  *      this state is only set upon a proper (re)join. */
                 RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA,
 
+                /* Leader: the application assignor left the assignment
+                 *         pending, awaiting rd_kafka_assignor_complete(). */
+                RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE,
+
                 /* Follower: SyncGroupRequest sent, awaiting response. */
                 RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC,
 
@@ -193,6 +197,13 @@ typedef struct rd_kafka_cgrp_s {
                                              *   leader and members. */
         void *rkcg_assignor_state;          /**< current partition
                                              *   assignor state */
+        struct rd_kafka_assignor_pending_s
+            *rkcg_assignor_pending;          /**< The application assignor's
+                                             *   pending assignment, NULL
+                                             *   when none; a completion for
+                                             *   any other one is stale. */
+        uint64_t rkcg_assignor_pending_seq; /**< Ids the pending assignments
+                                             *   are numbered with (logs). */
 
         int32_t rkcg_coord_id; /**< Current coordinator id,
                                 *   or -1 if not known. */
@@ -421,6 +432,10 @@ int rd_kafka_cgrp_topic_check(rd_kafka_cgrp_t *rkcg, const char *topic);
 void rd_kafka_cgrp_set_member_id(rd_kafka_cgrp_t *rkcg, const char *member_id);
 
 void rd_kafka_cgrp_set_join_state(rd_kafka_cgrp_t *rkcg, int join_state);
+
+rd_kafka_op_res_t rd_kafka_cgrp_assignor_complete_op(rd_kafka_t *rk,
+                                                     rd_kafka_q_t *rkq,
+                                                     rd_kafka_op_t *rko);
 
 rd_kafka_broker_t *rd_kafka_cgrp_get_coord(rd_kafka_cgrp_t *rkcg);
 void rd_kafka_cgrp_coord_query(rd_kafka_cgrp_t *rkcg, const char *reason);

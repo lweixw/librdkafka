@@ -313,7 +313,9 @@ typedef RD_MAP_TYPE(const rd_kafka_topic_partition_t *,
         ((RD_KAFKA_CGRP_HAS_JOINED(rkcg) &&                                    \
           ((rkcg)->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_WAIT_JOIN ||    \
            (rkcg)->rkcg_join_state ==                                          \
-               RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA)) ||                     \
+               RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA ||                       \
+           (rkcg)->rkcg_join_state ==                                          \
+               RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE)) ||              \
          (rkcg)->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC ||      \
          (rkcg)->rkcg_join_state ==                                            \
              RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN_TO_COMPLETE ||             \
@@ -337,6 +339,7 @@ const char *rd_kafka_cgrp_join_state_names[] = {
     "init",
     "wait-join",
     "wait-metadata",
+    "wait-assign-complete",
     "wait-sync",
     "wait-assign-call",
     "wait-unassign-call",
@@ -1984,40 +1987,48 @@ err_parse:
 /**
  * @brief Run group assignment.
  */
-static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
-                                       rd_kafka_assignor_t *rkas,
-                                       rd_kafka_resp_err_t err,
-                                       rd_kafka_metadata_internal_t *metadata,
-                                       rd_kafka_group_member_t *members,
-                                       int member_cnt) {
+/**
+ * @brief Finish a group assignment: validate or adjust it and send the
+ *        SyncGroup request, or rejoin on \p err.
+ *
+ * The tail of rd_kafka_cgrp_assignor_run(), also reached from
+ * rd_kafka_cgrp_assignor_complete_op() when an application assignor left
+ * the assignment pending.
+ */
+static void rd_kafka_cgrp_assignor_finish(rd_kafka_cgrp_t *rkcg,
+                                          rd_kafka_assignor_t *rkas,
+                                          rd_kafka_resp_err_t err,
+                                          const char *errstr_in,
+                                          rd_kafka_group_member_t *members,
+                                          int member_cnt) {
         char errstr[512];
 
-        if (err) {
-                rd_snprintf(errstr, sizeof(errstr),
-                            "Failed to get cluster metadata: %s",
-                            rd_kafka_err2str(err));
+        rd_snprintf(errstr, sizeof(errstr), "%s",
+                    errstr_in && *errstr_in ? errstr_in
+                    : err                   ? rd_kafka_err2str(err)
+                                            : "");
+        if (err)
                 goto err;
-        }
-
-        *errstr = '\0';
-
-        /* Run assignor */
-        err = rd_kafka_assignor_run(rkcg, rkas, &metadata->metadata, members,
-                                    member_cnt, errstr, sizeof(errstr));
-
-        if (err) {
-                if (!*errstr)
-                        rd_snprintf(errstr, sizeof(errstr), "%s",
-                                    rd_kafka_err2str(err));
-                goto err;
-        }
 
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP | RD_KAFKA_DBG_CONSUMER, "ASSIGNOR",
                      "Group \"%s\": \"%s\" assignor run for %d member(s)",
                      rkcg->rkcg_group_id->str, rkas->rkas_protocol_name->str,
                      member_cnt);
 
-        if (rkas->rkas_protocol == RD_KAFKA_REBALANCE_PROTOCOL_COOPERATIVE)
+        if (rkas->rkas_app) {
+                /* The application assignor withholds moving partitions
+                 * itself; giving owned-but-unassigned partitions back to
+                 * their owners would undo that, so instead check the
+                 * cooperative rule it must follow. */
+                if (rkas->rkas_protocol ==
+                        RD_KAFKA_REBALANCE_PROTOCOL_COOPERATIVE &&
+                    !rd_kafka_assignor_cooperative_check(
+                        members, member_cnt, errstr, sizeof(errstr))) {
+                        err = RD_KAFKA_RESP_ERR__FAIL;
+                        goto err;
+                }
+        } else if (rkas->rkas_protocol ==
+                   RD_KAFKA_REBALANCE_PROTOCOL_COOPERATIVE)
                 rd_kafka_cooperative_protocol_adjust_assignment(rkcg, members,
                                                                 member_cnt);
 
@@ -2029,7 +2040,7 @@ static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
         rd_kafka_SyncGroupRequest(
             rkcg->rkcg_coord, rkcg->rkcg_group_id, rkcg->rkcg_generation_id,
             rkcg->rkcg_member_id, rkcg->rkcg_group_instance_id, members,
-            err ? 0 : member_cnt, RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
+            member_cnt, RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
             rd_kafka_cgrp_handle_SyncGroup, rkcg);
         return;
 
@@ -2042,6 +2053,103 @@ err:
 
         rd_kafka_cgrp_rejoin(rkcg, "%s assignor failed: %s",
                              rkas->rkas_protocol_name->str, errstr);
+}
+
+
+/**
+ * @brief Run group assignment.
+ */
+static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
+                                       rd_kafka_assignor_t *rkas,
+                                       rd_kafka_resp_err_t err,
+                                       rd_kafka_metadata_internal_t *metadata,
+                                       rd_kafka_group_member_t *members,
+                                       int member_cnt) {
+        char errstr[512];
+
+        if (err) {
+                rd_snprintf(errstr, sizeof(errstr),
+                            "Failed to get cluster metadata: %s",
+                            rd_kafka_err2str(err));
+                rd_kafka_cgrp_assignor_finish(rkcg, rkas, err, errstr, members,
+                                              member_cnt);
+                return;
+        }
+
+        *errstr = '\0';
+
+        /* Run assignor */
+        err = rd_kafka_assignor_run(rkcg, rkas, &metadata->metadata, members,
+                                    member_cnt, errstr, sizeof(errstr));
+
+        if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
+                /* The application assignor completes later through
+                 * rd_kafka_assignor_complete(); the members stay on
+                 * rkcg_group_leader until then. */
+                rd_kafka_dbg(rkcg->rkcg_rk, CGRP | RD_KAFKA_DBG_CONSUMER,
+                             "ASSIGNOR",
+                             "Group \"%s\": \"%s\" assignor left the "
+                             "assignment of %d member(s) pending (id %" PRIu64
+                             ")",
+                             rkcg->rkcg_group_id->str,
+                             rkas->rkas_protocol_name->str, member_cnt,
+                             rkcg->rkcg_assignor_pending->id);
+                rd_kafka_cgrp_set_join_state(
+                    rkcg, RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE);
+                return;
+        }
+
+        rd_kafka_cgrp_assignor_finish(rkcg, rkas, err, errstr, members,
+                                      member_cnt);
+}
+
+
+/**
+ * @brief Op callback from rd_kafka_assignor_complete(): the application
+ *        finished a pending assignment.
+ *
+ * @locality rdkafka main thread
+ */
+rd_kafka_op_res_t rd_kafka_cgrp_assignor_complete_op(rd_kafka_t *rk,
+                                                     rd_kafka_q_t *rkq,
+                                                     rd_kafka_op_t *rko) {
+        rd_kafka_cgrp_t *rkcg = rk->rk_cgrp;
+        rd_kafka_assignor_pending_t *pending;
+
+        if (rko->rko_err == RD_KAFKA_RESP_ERR__DESTROY)
+                return RD_KAFKA_OP_RES_HANDLED; /* Terminating */
+
+        /* The op's pointer is only compared: the pending it names may be
+         * gone if the group abandoned it and the application released it. */
+        if (rkcg->rkcg_join_state !=
+                RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE ||
+            rko->rko_u.assignor_complete.pending !=
+                rkcg->rkcg_assignor_pending ||
+            !rkcg->rkcg_group_leader.members) {
+                rd_kafka_dbg(rk, CGRP, "ASSIGNOR",
+                             "Group \"%s\": dropping stale assignor "
+                             "completion in state %s (pending %" PRIu64 ")",
+                             rkcg->rkcg_group_id->str,
+                             rd_kafka_cgrp_join_state_names
+                                 [rkcg->rkcg_join_state],
+                             rkcg->rkcg_assignor_pending
+                                 ? rkcg->rkcg_assignor_pending->id
+                                 : 0);
+                return RD_KAFKA_OP_RES_HANDLED;
+        }
+
+        pending                      = rkcg->rkcg_assignor_pending;
+        rkcg->rkcg_assignor_pending  = NULL;
+
+        rd_kafka_cgrp_assignor_finish(
+            rkcg, rkcg->rkcg_assignor, rko->rko_u.assignor_complete.err,
+            rko->rko_u.assignor_complete.errstr,
+            rkcg->rkcg_group_leader.members,
+            rkcg->rkcg_group_leader.member_cnt);
+
+        rd_kafka_assignor_pending_destroy(pending);
+
+        return RD_KAFKA_OP_RES_HANDLED;
 }
 
 
@@ -4925,6 +5033,26 @@ static void rd_kafka_cgrp_group_leader_reset(rd_kafka_cgrp_t *rkcg,
                      "Group \"%.*s\": resetting group leader info: %s",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), reason);
 
+        if (rkcg->rkcg_assignor_pending) {
+                /* The application may still be writing into the members
+                 * through its handle: hand them to the pending, which frees
+                 * them with its last reference. */
+                rd_kafka_assignor_pending_t *pending =
+                    rkcg->rkcg_assignor_pending;
+                rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "GRPLEADER",
+                             "Group \"%.*s\": pending assignment %" PRIu64
+                             " abandoned: %s",
+                             RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), pending->id,
+                             reason);
+                rd_assert(!pending->members);
+                pending->members    = rkcg->rkcg_group_leader.members;
+                pending->member_cnt = rkcg->rkcg_group_leader.member_cnt;
+                rkcg->rkcg_group_leader.members    = NULL;
+                rkcg->rkcg_group_leader.member_cnt = 0;
+                rkcg->rkcg_assignor_pending        = NULL;
+                rd_kafka_assignor_pending_destroy(pending);
+        }
+
         if (rkcg->rkcg_group_leader.members) {
                 int i;
 
@@ -6044,6 +6172,7 @@ static void rd_kafka_cgrp_join_state_serve(rd_kafka_cgrp_t *rkcg) {
 
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_JOIN:
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA:
+        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE:
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC:
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN_TO_COMPLETE:
                 /* FIXME: I think we might have to send heartbeats in

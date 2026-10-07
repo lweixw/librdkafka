@@ -123,6 +123,7 @@ const char *rd_kafka_op2str(rd_kafka_op_type_t type) {
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] =
                 "REPLY:RD_KAFKA_OP_TERMINATE_TELEMETRY",
             [RD_KAFKA_OP_ELECTLEADERS] = "REPLY:ELECTLEADERS",
+            [RD_KAFKA_OP_ASSIGNOR_COMPLETE] = "REPLY:ASSIGNOR_COMPLETE",
         };
 
         if (type & RD_KAFKA_OP_REPLY)
@@ -287,6 +288,8 @@ rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
                 sizeof(rko->rko_u.telemetry_broker),
             [RD_KAFKA_OP_TERMINATE_TELEMETRY] = _RD_KAFKA_OP_EMPTY,
             [RD_KAFKA_OP_ELECTLEADERS] = sizeof(rko->rko_u.admin_request),
+            [RD_KAFKA_OP_ASSIGNOR_COMPLETE] =
+                sizeof(rko->rko_u.assignor_complete),
         };
         size_t tsize = op2size[type & ~RD_KAFKA_OP_FLAGMASK];
 
@@ -404,6 +407,10 @@ void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
 
         case RD_KAFKA_OP_OFFSET_RESET:
                 RD_IF_FREE(rko->rko_u.offset_reset.reason, rd_free);
+                break;
+
+        case RD_KAFKA_OP_ASSIGNOR_COMPLETE:
+                RD_IF_FREE(rko->rko_u.assignor_complete.errstr, rd_free);
                 break;
 
         case RD_KAFKA_OP_METADATA:

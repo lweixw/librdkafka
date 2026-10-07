@@ -2087,6 +2087,211 @@ void rd_kafka_conf_set_rebalance_cb(
                          void *opaque));
 
 
+/**
+ * @name Application partition assignor (classic group protocol)
+ * @{
+ *
+ * An application may register one partition assignor of its own and select
+ * it by name through `partition.assignment.strategy`. It takes part in the
+ * classic consumer group protocol exactly as the built-in assignors do:
+ * every member's JoinGroup metadata carries the bytes its \p subscription_cb
+ * returns, the group leader's \p assign_cb decides each member's partitions
+ * and userdata, and every member's \p on_assignment_cb receives the
+ * partitions and userdata the leader assigned to it.
+ *
+ * All three callbacks run on the client's internal main thread. They must not
+ * block and must not call any API that waits for that thread
+ * (rd_kafka_assignment(), rd_kafka_memberid(), rd_kafka_position(),
+ * rd_kafka_committed(), ...). An \p assign_cb that needs to wait for anything
+ * returns RD_KAFKA_ASSIGNOR_PENDING and finishes the assignment later with
+ * rd_kafka_assignor_complete() from any thread.
+ *
+ * The cooperative protocol's post-assignment adjustment the built-in
+ * assignors rely on is not applied to an application assignor: the assignor
+ * itself withholds a partition that moves between members (assigning it to
+ * nobody, so that its owner revokes it and a follow-up rebalance can hand it
+ * over), and an assignment that both revokes a partition from one member and
+ * adds it to another in the same round fails.
+ */
+
+/* Defined further down. */
+struct rd_kafka_metadata;
+
+/** @brief One member of the group as seen by the leader's \p assign_cb. */
+typedef struct rd_kafka_assignor_member_s rd_kafka_assignor_member_t;
+
+/** @brief Handle for finishing a pending assignment, see
+ *         rd_kafka_assignor_complete(). */
+typedef struct rd_kafka_assignor_pending_s rd_kafka_assignor_pending_t;
+
+/** @brief What the \p assign_cb did. */
+typedef enum rd_kafka_assignor_result_t {
+        /** Every member's assignment and userdata are set. */
+        RD_KAFKA_ASSIGNOR_DONE = 0,
+        /** The application keeps the \p pending handle and will call
+         *  rd_kafka_assignor_complete() once it has set the members'
+         *  assignments and userdata. The members stay valid until then,
+         *  even if the group rejoins meanwhile (the completion is then
+         *  dropped). */
+        RD_KAFKA_ASSIGNOR_PENDING = 1,
+        /** The assignment failed; \p errstr says why. The group rejoins. */
+        RD_KAFKA_ASSIGNOR_FAILED = 2,
+} rd_kafka_assignor_result_t;
+
+/** @brief Rebalance protocol the application assignor speaks. */
+typedef enum rd_kafka_assignor_protocol_t {
+        RD_KAFKA_ASSIGNOR_PROTOCOL_EAGER       = 0,
+        RD_KAFKA_ASSIGNOR_PROTOCOL_COOPERATIVE = 1,
+} rd_kafka_assignor_protocol_t;
+
+/**
+ * @brief Produces the userdata this member puts into its JoinGroup metadata.
+ *
+ * @param topics The subscribed topic names.
+ * @param owned_partitions The partitions this member owns going into the
+ *        rebalance, or NULL.
+ * @param userdata Set to a buffer allocated with rd_kafka_mem_malloc(), or
+ *        left NULL for no userdata; the library frees it.
+ * @param userdata_size Set to the buffer's size.
+ */
+typedef void (*rd_kafka_assignor_subscription_cb_t)(
+    rd_kafka_t *rk,
+    const char **topics,
+    size_t topic_cnt,
+    const rd_kafka_topic_partition_list_t *owned_partitions,
+    void **userdata,
+    size_t *userdata_size,
+    void *opaque);
+
+/**
+ * @brief Assigns partitions and userdata to every member (the leader only).
+ *
+ * @param member_id This client's own member id.
+ * @param metadata Cluster metadata for the subscribed topics.
+ * @param members The group's members, read through
+ *        rd_kafka_assignor_member_at() and the accessors below, written
+ *        through rd_kafka_assignor_member_set_assignment() and
+ *        rd_kafka_assignor_member_set_userdata(). Valid until the callback
+ *        returns, or, after RD_KAFKA_ASSIGNOR_PENDING, until
+ *        rd_kafka_assignor_complete() is called.
+ * @param pending The handle to complete with after returning
+ *        RD_KAFKA_ASSIGNOR_PENDING; not to be used otherwise.
+ */
+typedef rd_kafka_assignor_result_t (*rd_kafka_assignor_assign_cb_t)(
+    rd_kafka_t *rk,
+    const char *member_id,
+    const struct rd_kafka_metadata *metadata,
+    rd_kafka_assignor_member_t *members,
+    size_t member_cnt,
+    rd_kafka_assignor_pending_t *pending,
+    char *errstr,
+    size_t errstr_size,
+    void *opaque);
+
+/**
+ * @brief Receives the partitions and userdata the leader assigned to this
+ *        member, before the assignment is applied.
+ *
+ * @param userdata The assigned userdata, or NULL with size 0.
+ * @param group_metadata Group id, generation, member id and group instance
+ *        id of this member, valid during the call.
+ */
+typedef void (*rd_kafka_assignor_on_assignment_cb_t)(
+    rd_kafka_t *rk,
+    const rd_kafka_topic_partition_list_t *assignment,
+    const void *userdata,
+    size_t userdata_size,
+    const rd_kafka_consumer_group_metadata_t *group_metadata,
+    void *opaque);
+
+/**
+ * @brief \b Consumer: Register the application's partition assignor.
+ *
+ * The assignor is created with the client and selected through
+ * `partition.assignment.strategy`, whose value must then name it (alone, or
+ * alongside built-in assignors of the same \p protocol). \p protocol_name must
+ * not be a built-in assignor's name. The registration is copied by
+ * rd_kafka_conf_dup().
+ *
+ * @param opaque Passed to every callback; must outlive the client.
+ */
+RD_EXPORT
+void rd_kafka_conf_set_assignor(
+    rd_kafka_conf_t *conf,
+    const char *protocol_name,
+    rd_kafka_assignor_protocol_t protocol,
+    rd_kafka_assignor_subscription_cb_t subscription_cb,
+    rd_kafka_assignor_assign_cb_t assign_cb,
+    rd_kafka_assignor_on_assignment_cb_t on_assignment_cb,
+    void *opaque);
+
+/** @returns member \p idx of the \p members handed to the assign callback. */
+RD_EXPORT
+rd_kafka_assignor_member_t *
+rd_kafka_assignor_member_at(rd_kafka_assignor_member_t *members, size_t idx);
+
+/** @returns the member's id. */
+RD_EXPORT
+const char *rd_kafka_assignor_member_id(const rd_kafka_assignor_member_t *member);
+
+/** @returns the member's group instance id, or NULL. */
+RD_EXPORT
+const char *rd_kafka_assignor_member_group_instance_id(
+    const rd_kafka_assignor_member_t *member);
+
+/** @returns the member's rack id, or NULL. */
+RD_EXPORT
+const char *
+rd_kafka_assignor_member_rack_id(const rd_kafka_assignor_member_t *member);
+
+/** @returns the member's subscribed topics (partition unset). */
+RD_EXPORT
+const rd_kafka_topic_partition_list_t *
+rd_kafka_assignor_member_subscription(const rd_kafka_assignor_member_t *member);
+
+/** @returns the partitions the member owns going into the rebalance, or
+ *           NULL if it reported none. */
+RD_EXPORT
+const rd_kafka_topic_partition_list_t *rd_kafka_assignor_member_owned_partitions(
+    const rd_kafka_assignor_member_t *member);
+
+/** @returns the userdata the member's subscription carried, or NULL with
+ *           \p *sizep 0. */
+RD_EXPORT
+const void *
+rd_kafka_assignor_member_userdata(const rd_kafka_assignor_member_t *member,
+                                  size_t *sizep);
+
+/** @brief Sets the partitions assigned to the member (copied). */
+RD_EXPORT
+void rd_kafka_assignor_member_set_assignment(
+    rd_kafka_assignor_member_t *member,
+    const rd_kafka_topic_partition_list_t *assignment);
+
+/** @brief Sets the userdata assigned to the member (copied). */
+RD_EXPORT
+void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
+                                           const void *userdata,
+                                           size_t size);
+
+/**
+ * @brief Finishes an assignment the assign callback left pending.
+ *
+ * May be called from any thread, exactly once per handle; the handle is
+ * consumed. With \p err RD_KAFKA_RESP_ERR_NO_ERROR the members' assignments
+ * and userdata are sent to the group; otherwise the group rejoins and
+ * \p errstr (may be NULL) is logged. A completion that arrives after the group
+ * rejoined, unsubscribed or picked another assignor is dropped. The client
+ * must still exist.
+ */
+RD_EXPORT
+void rd_kafka_assignor_complete(rd_kafka_assignor_pending_t *pending,
+                                rd_kafka_resp_err_t err,
+                                const char *errstr);
+
+/**@}*/
+
+
 
 /**
  * @brief \b Consumer: Set offset commit callback for use with consumer groups.
