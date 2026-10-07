@@ -193,7 +193,8 @@ void rd_kafka_conf_app_assignor_copy(int scope,
                                      const void *srcptr,
                                      size_t filter_cnt,
                                      const char **filter);
-rd_kafka_resp_err_t rd_kafka_app_assignor_init(rd_kafka_t *rk);
+rd_kafka_resp_err_t
+rd_kafka_app_assignor_init(rd_kafka_t *rk, char *errstr, size_t errstr_size);
 
 /**
  * A pending application assignment, shared by the cgrp (on

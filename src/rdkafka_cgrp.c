@@ -481,6 +481,7 @@ void rd_kafka_cgrp_set_join_state(rd_kafka_cgrp_t *rkcg, int join_state) {
 void rd_kafka_cgrp_destroy_final(rd_kafka_cgrp_t *rkcg) {
         rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_subscription);
         rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_group_leader.members);
+        rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_assignor_pending);
         rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_subscription_topics);
         rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_subscription_regex);
         rd_kafka_cgrp_set_member_id(rkcg, NULL);
@@ -2233,6 +2234,8 @@ static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
                                     member_cnt, errstr, sizeof(errstr));
 
         if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
+                rd_kafka_assert(rkcg->rkcg_rk,
+                                rkas->rkas_app && rkcg->rkcg_assignor_pending);
                 /* The application assignor completes later through
                  * rd_kafka_assignor_complete(); the members stay on
                  * rkcg_group_leader until then. No heartbeat is sent in
@@ -2283,10 +2286,12 @@ static void rd_kafka_cgrp_assignor_pending_tmr_cb(rd_kafka_timers_t *rkts,
 
         rd_kafka_log(rkcg->rkcg_rk, LOG_WARNING, "ASSIGNOR",
                      "Group \"%s\": application assignor did not complete "
-                     "the assignment within session.timeout.ms (%dms) of "
-                     "the JoinGroup response: rejoining group",
+                     "the assignment within session.timeout.ms less "
+                     "heartbeat.interval.ms (%dms) of the JoinGroup "
+                     "response: rejoining group",
                      rkcg->rkcg_group_id->str,
-                     rkcg->rkcg_rk->rk_conf.group_session_timeout_ms);
+                     rkcg->rkcg_rk->rk_conf.group_session_timeout_ms -
+                         rkcg->rkcg_rk->rk_conf.group_heartbeat_intvl_ms);
 
         rd_kafka_cgrp_rejoin(rkcg,
                              "application assignor did not complete within "
@@ -2317,8 +2322,8 @@ rd_kafka_op_res_t rd_kafka_cgrp_assignor_complete_op(rd_kafka_t *rk,
             !rkcg->rkcg_group_leader.members) {
                 rd_kafka_dbg(rk, CGRP, "ASSIGNOR",
                              "Group \"%s\": dropping stale assignor "
-                             "completion %" PRIu64 " in state %s (pending %" PRIu64
-                             ")",
+                             "completion %" PRIu64
+                             " in state %s (pending %" PRIu64 ")",
                              rkcg->rkcg_group_id->str,
                              rko->rko_u.assignor_complete.id,
                              rd_kafka_cgrp_join_state_names
@@ -4204,6 +4209,11 @@ static void rd_kafka_cgrp_terminated(rd_kafka_cgrp_t *rkcg) {
          * so consumer group operation need to be served with a no-op
          * when `rkcg_terminated` is true. */
 
+        /* Every terminate passes through unsubscribe, which gives a
+         * pending application assignment up; make sure of it before the
+         * ops queue a late completion would land on is disabled. */
+        rd_kafka_cgrp_assignor_pending_abandon(rkcg, "terminated");
+
         rd_atomic32_set(&rkcg->rkcg_terminated, rd_true);
         rd_kafka_q_disable(rkcg->rkcg_ops);
 
@@ -5925,6 +5935,12 @@ static void rd_kafka_cgrp_revoke_all_rejoin(rd_kafka_cgrp_t *rkcg,
                              "Group \"%.*s\": consumer is "
                              "terminating, skipping rejoin",
                              RD_KAFKAP_STR_PR(rkcg->rkcg_group_id));
+                /* With nothing to revoke there is no unassign to leave
+                 * after: leave now, or the group evicts this member at
+                 * session.timeout.ms (a leader closed under a pending
+                 * application assignment owns nothing in its first
+                 * generation). */
+                rd_kafka_cgrp_leave_maybe(rkcg);
                 return;
         }
 

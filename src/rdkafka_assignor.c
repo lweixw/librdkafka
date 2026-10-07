@@ -609,13 +609,13 @@ int rd_kafka_assignors_init(rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         /* Then the application's, so that partition.assignment.strategy
          * may name it below. */
         if (rk->rk_conf.app_assignor.assign_cb) {
-                rd_kafka_resp_err_t err = rd_kafka_app_assignor_init(rk);
-                if (err) {
+                char reason[256];
+                if (rd_kafka_app_assignor_init(rk, reason, sizeof(reason))) {
                         rd_snprintf(errstr, errstr_size,
                                     "Failed to register application "
                                     "assignor \"%s\": %s",
                                     rk->rk_conf.app_assignor.protocol_name,
-                                    rd_kafka_err2str(err));
+                                    reason);
                         return -1;
                 }
         }
@@ -1851,7 +1851,8 @@ rd_kafka_app_assignor_get_metadata(const rd_kafka_assignor_t *rkas,
         size_t userdata_size = 0;
         rd_kafkap_bytes_t *metadata;
         int topic_cnt = rd_list_cnt(topics);
-        const char **names = rd_malloc(sizeof(*names) * (topic_cnt > 0 ? topic_cnt : 1));
+        const char **names =
+            rd_malloc(sizeof(*names) * (topic_cnt > 0 ? topic_cnt : 1));
         const rd_kafka_topic_info_t *tinfo;
         int i;
 
@@ -1862,6 +1863,7 @@ rd_kafka_app_assignor_get_metadata(const rd_kafka_assignor_t *rkas,
                 rd_kafka_app_assignor(rk)->subscription_cb(
                     rk, names, (size_t)topic_cnt, owned, &userdata,
                     &userdata_size, rd_kafka_app_assignor(rk)->opaque);
+        rd_kafka_assert(rk, !userdata || userdata_size <= INT32_MAX);
 
         metadata = rd_kafka_consumer_protocol_member_metadata_new(
             topics, userdata, userdata ? userdata_size : 0, owned,
@@ -1874,7 +1876,8 @@ rd_kafka_app_assignor_get_metadata(const rd_kafka_assignor_t *rkas,
         return metadata;
 }
 
-static void rd_kafka_assignor_pending_free(rd_kafka_assignor_pending_t *pending) {
+static void
+rd_kafka_assignor_pending_free(rd_kafka_assignor_pending_t *pending) {
         int i;
 
         for (i = 0; i < pending->member_cnt; i++)
@@ -1969,9 +1972,39 @@ static void rd_kafka_app_assignor_on_assignment(
                     rd_kafka_app_assignor(rk)->opaque);
 }
 
-rd_kafka_resp_err_t rd_kafka_app_assignor_init(rd_kafka_t *rk) {
+rd_kafka_resp_err_t
+rd_kafka_app_assignor_init(rd_kafka_t *rk, char *errstr, size_t errstr_size) {
+        const char *name = rk->rk_conf.app_assignor.protocol_name;
         rd_kafka_resp_err_t err;
         rd_kafka_assignor_t *rkas;
+
+        /* The strategy parser splits on commas and trims whitespace, so a
+         * name with either could never be selected. */
+        if (!*name || strpbrk(name, ", \t\r\n")) {
+                rd_snprintf(errstr, errstr_size,
+                            "the name must be non-empty and contain neither "
+                            "commas nor whitespace");
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        }
+        if (rk->rk_conf.app_assignor.protocol !=
+                RD_KAFKA_ASSIGNOR_PROTOCOL_EAGER &&
+            rk->rk_conf.app_assignor.protocol !=
+                RD_KAFKA_ASSIGNOR_PROTOCOL_COOPERATIVE) {
+                rd_snprintf(errstr, errstr_size, "unknown protocol %d",
+                            (int)rk->rk_conf.app_assignor.protocol);
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        }
+        /* A pending assignment is given up session.timeout.ms less
+         * heartbeat.interval.ms after the JoinGroup response. */
+        if (rk->rk_conf.group_heartbeat_intvl_ms >=
+            rk->rk_conf.group_session_timeout_ms) {
+                rd_snprintf(errstr, errstr_size,
+                            "heartbeat.interval.ms (%d) must be less than "
+                            "session.timeout.ms (%d)",
+                            rk->rk_conf.group_heartbeat_intvl_ms,
+                            rk->rk_conf.group_session_timeout_ms);
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        }
 
         err = rd_kafka_assignor_add(
             rk, "consumer", rk->rk_conf.app_assignor.protocol_name,
@@ -1982,10 +2015,12 @@ rd_kafka_resp_err_t rd_kafka_app_assignor_init(rd_kafka_t *rk) {
             rd_kafka_app_assignor_assign, rd_kafka_app_assignor_get_metadata,
             rd_kafka_app_assignor_on_assignment, NULL /* destroy_state */,
             NULL /* unittest */, rk /* opaque */);
-        if (err)
+        if (err) {
+                rd_snprintf(errstr, errstr_size, "%s", rd_kafka_err2str(err));
                 return err;
+        }
 
-        rkas = rd_kafka_assignor_find(rk, rk->rk_conf.app_assignor.protocol_name);
+        rkas = rd_kafka_assignor_find(rk, name);
         rd_assert(rkas);
         rkas->rkas_app = 1;
 
@@ -2219,11 +2254,21 @@ void rd_kafka_assignor_member_set_assignment(
     rd_kafka_assignor_member_t *member,
     const rd_kafka_topic_partition_list_t *assignment) {
         rd_kafka_group_member_t *rkgm = rd_kafka_assignor_member_int(member);
+        int i;
+
         if (rkgm->rkgm_assignment)
                 rd_kafka_topic_partition_list_destroy(rkgm->rkgm_assignment);
+        /* Topic and partition only: a copy would keep any toppar reference
+         * the application's list carries (one from rd_kafka_assignment(),
+         * say), and an abandoned pending is freed on the application's
+         * thread, possibly after the client is gone. */
         rkgm->rkgm_assignment =
-            assignment ? rd_kafka_topic_partition_list_copy(assignment)
-                       : rd_kafka_topic_partition_list_new(0);
+            rd_kafka_topic_partition_list_new(assignment ? assignment->cnt
+                                                         : 0);
+        for (i = 0; assignment && i < assignment->cnt; i++)
+                rd_kafka_topic_partition_list_add(
+                    rkgm->rkgm_assignment, assignment->elems[i].topic,
+                    assignment->elems[i].partition);
 }
 
 void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,

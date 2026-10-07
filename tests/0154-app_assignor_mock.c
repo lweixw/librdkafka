@@ -27,6 +27,8 @@
  */
 
 #include "test.h"
+#include "../src/rdkafka_proto.h"
+#include "../src/rdkafka_mock.h"
 
 #include "../src/tinycthread.h"
 
@@ -44,7 +46,8 @@
  *  - done: the leader assigns synchronously; every member's subscription
  *    userdata reaches the leader (the third member sends none) and every
  *    member gets back the userdata the leader set for it; the accessors
- *    report the subscription, no group instance id and no rack; a withheld
+ *    report the subscription, the group instance id and the rack of the
+ *    members that set them and NULL for the others; a withheld
  *    partition is NOT given back to its owner (the cooperative adjustment
  *    the built-in assignors get is skipped), and the follow-up rebalance
  *    hands it over;
@@ -54,20 +57,25 @@
  *    rd_kafka_assignor_complete();
  *  - close during pending: the leader is closed and destroyed while its
  *    assignment is pending and the handle completes afterwards: the members
- *    behind the handle stay valid and the completion is a safe no-op;
+ *    behind the handle stay valid, the completion is a safe no-op, and the
+ *    close still sends a LeaveGroup (the leader owns nothing to revoke);
  *  - join during pending: a member joins under a pending assignment, so
  *    the coordinator refuses that assignment's SyncGroup and the leader
- *    assigns again for three;
+ *    assigns again for three; the first assignment is never applied;
  *  - timeout: a pending assignment is not completed within
- *    session.timeout.ms of the JoinGroup response: the library gives it up
- *    and rejoins before the coordinator evicts the leader (which stays
- *    leader), and the late completion is dropped;
+ *    session.timeout.ms less a heartbeat interval of the JoinGroup
+ *    response: the library gives it up and rejoins before the coordinator
+ *    evicts the leader (which stays leader), and the late completion is
+ *    dropped; the give-up is timed against the first call, which itself
+ *    spends a second in the callback;
  *  - duplicate: an assignment that hands one partition to two members is
  *    rejected and the group rejoins;
  *  - fail sync / fail async: the leader fails one assignment, synchronously
  *    or through rd_kafka_assignor_complete(err), and the group rejoins;
  *  - violation: an assignment that moves an owned partition directly is
- *    rejected and the group rejoins until the assignor behaves;
+ *    rejected and the group rejoins until the assignor behaves; round 1
+ *    leaves p0 unassigned there, so the violating call also adds an
+ *    unowned partition that sorts before the moved ones;
  *  - eager: under the EAGER protocol every rebalance starts from nothing
  *    owned, so partitions move at once.
  */
@@ -111,10 +119,12 @@ static struct {
         /** Per assign call: the member count and the leader's member id. */
         int call_members[MAX_CALLS];
         char call_leader[MAX_CALLS][128];
+        /** Per assign call: when assign_cb was entered. */
+        int64_t call_ts[MAX_CALLS];
+        /** When the library gave a pending assignment up (timeout). */
+        int64_t ts_giveup;
         /** The member id of the leader that ran the last assign call. */
         char leader_id[128];
-        /** Member count of the violating assign call. */
-        int violation_members;
         /** The first assign call with all three members: the one the
          *  violation and failure scenarios act on. */
         int first_three_member_call;
@@ -123,7 +133,10 @@ static struct {
         int seen_cnt;
         /** Pending threads wait on this before completing when set. */
         rd_bool_t hold_completion;
-        int threads;
+        /** Pending threads, joined by release_pending_threads(). */
+        thrd_t thrds[MAX_CALLS];
+        int thrd_cnt;
+        int joined;
 } scn;
 
 struct pending_job {
@@ -204,16 +217,22 @@ static void assign_members(rd_kafka_assignor_member_t *members,
                     rd_kafka_assignor_member_userdata(sorted[i], &size);
                 const rd_kafka_topic_partition_list_t *sub =
                     rd_kafka_assignor_member_subscription(sorted[i]);
+                const char *gi =
+                    rd_kafka_assignor_member_group_instance_id(sorted[i]);
+                const char *rack = rd_kafka_assignor_member_rack_id(sorted[i]);
 
                 TEST_ASSERT(sub && sub->cnt == 1 &&
                                 !strcmp(sub->elems[0].topic, TOPIC),
                             "member %d: unexpected subscription", (int)i);
-                TEST_ASSERT(!rd_kafka_assignor_member_group_instance_id(
-                                sorted[i]),
-                            "member %d: unexpected group instance id",
-                            (int)i);
-                TEST_ASSERT(!rd_kafka_assignor_member_rack_id(sorted[i]),
-                            "member %d: unexpected rack id", (int)i);
+                /* c2 (no userdata) is the static member, c1 has a rack. */
+                TEST_ASSERT(!ud ? gi && !strcmp(gi, "gi-c2") : !gi,
+                            "member %d: group instance id \"%s\"", (int)i,
+                            gi ? gi : "(null)");
+                TEST_ASSERT(ud && size == 6 && !strncmp(ud, "sub:c1", 6)
+                                ? rack && !strcmp(rack, "rack-c1")
+                                : !rack,
+                            "member %d: rack \"%s\"", (int)i,
+                            rack ? rack : "(null)");
                 TEST_ASSERT(*rd_kafka_assignor_member_id(sorted[i]),
                             "member %d: empty member id", (int)i);
 
@@ -244,6 +263,14 @@ static void assign_members(rd_kafka_assignor_member_t *members,
                         size_t j;
 
                         if (target != i)
+                                continue;
+
+                        /* The violation scenario leaves p0 unassigned in
+                         * round 1: its violating call then also adds an
+                         * unowned partition that sorts first, which the
+                         * cooperative check's merge has to step past. */
+                        if (mode == MODE_VIOLATION && member_cnt == 2 &&
+                            p == 0)
                                 continue;
 
                         for (j = 0; j < member_cnt; j++) {
@@ -286,12 +313,6 @@ static void assign_members(rd_kafka_assignor_member_t *members,
                 rd_kafka_assignor_member_set_userdata(sorted[i], ud,
                                                       strlen(ud));
         }
-
-        if (violate) {
-                mtx_lock(&lock);
-                scn.violation_members = (int)member_cnt;
-                mtx_unlock(&lock);
-        }
 }
 
 static int pending_thread(void *arg) {
@@ -321,11 +342,6 @@ static int pending_thread(void *arg) {
         rd_kafka_assignor_complete(job->pending, err,
                                    err ? "failed on purpose" : NULL);
 
-        mtx_lock(&lock);
-        scn.threads--;
-        cnd_broadcast(&cnd);
-        mtx_unlock(&lock);
-
         free(job);
         return 0;
 }
@@ -351,6 +367,7 @@ assign_cb(rd_kafka_t *rk,
         call = ++scn.assign_calls;
         TEST_ASSERT(call < MAX_CALLS, "too many assign calls");
         scn.call_members[call] = (int)member_cnt;
+        scn.call_ts[call]      = test_clock();
         rd_snprintf(scn.call_leader[call], sizeof(scn.call_leader[call]), "%s",
                     member_id);
         if (member_cnt == C_CNT && !scn.first_three_member_call)
@@ -374,6 +391,12 @@ assign_cb(rd_kafka_t *rk,
                 return RD_KAFKA_ASSIGNOR_FAILED;
         }
 
+        /* The timeout scenario's first call spends a second in the
+         * callback before leaving the assignment pending: the give-up is
+         * timed from the JoinGroup response, not from the PENDING return. */
+        if (mode == MODE_TIMEOUT && call == 1)
+                rd_usleep(1000 * 1000, NULL);
+
         if (mode == MODE_PENDING || mode == MODE_CLOSE_DURING_PENDING ||
             mode == MODE_JOIN_DURING_PENDING || mode == MODE_TIMEOUT ||
             mode == MODE_FAIL_ASYNC) {
@@ -384,13 +407,13 @@ assign_cb(rd_kafka_t *rk,
                 job->members    = members;
                 job->member_cnt = member_cnt;
                 job->call       = call;
-                mtx_lock(&lock);
-                scn.threads++;
-                mtx_unlock(&lock);
                 TEST_ASSERT(thrd_create(&thrd, pending_thread, job) ==
                                 thrd_success,
                             "thrd_create failed");
-                thrd_detach(thrd);
+                mtx_lock(&lock);
+                TEST_ASSERT(scn.thrd_cnt < MAX_CALLS, "too many threads");
+                scn.thrds[scn.thrd_cnt++] = thrd;
+                mtx_unlock(&lock);
                 return RD_KAFKA_ASSIGNOR_PENDING;
         }
 
@@ -534,13 +557,49 @@ static void await_assign_calls(int cnt) {
         }
 }
 
+/**
+ * @brief Release the held completions and join every pending thread
+ *        spawned so far; one spawned later is joined by the next call.
+ */
 static void release_pending_threads(void) {
         mtx_lock(&lock);
         scn.hold_completion = rd_false;
         cnd_broadcast(&cnd);
-        while (scn.threads > 0)
-                cnd_wait(&cnd, &lock);
+        while (scn.joined < scn.thrd_cnt) {
+                thrd_t thrd = scn.thrds[scn.joined++];
+                mtx_unlock(&lock);
+                thrd_join(thrd, NULL);
+                mtx_lock(&lock);
+        }
         mtx_unlock(&lock);
+}
+
+/**
+ * @brief Number of requests with \p api_key the mock cluster has seen.
+ */
+static size_t requests_seen(rd_kafka_mock_cluster_t *mcluster,
+                            int16_t api_key) {
+        size_t cnt, i, seen = 0;
+        rd_kafka_mock_request_t **reqs =
+            rd_kafka_mock_get_requests(mcluster, &cnt);
+        for (i = 0; i < cnt; i++)
+                if (rd_kafka_mock_request_api_key(reqs[i]) == api_key)
+                        seen++;
+        rd_kafka_mock_request_destroy_array(reqs, cnt);
+        return seen;
+}
+
+/**
+ * @brief Records when the library gives a pending assignment up.
+ */
+static void
+log_cb(const rd_kafka_t *rk, int level, const char *fac, const char *buf) {
+        if (!strcmp(fac, "ASSIGNOR") && strstr(buf, "did not complete")) {
+                mtx_lock(&lock);
+                scn.ts_giveup = test_clock();
+                mtx_unlock(&lock);
+        }
+        rd_kafka_log_print(rk, level, fac, buf);
 }
 
 static int leader_index(struct consumer *c, int c_cnt) {
@@ -580,6 +639,9 @@ static void do_test(enum mode mode) {
         int i;
         /* Two members: p -> p mod 2. */
         const int round1[C_CNT][PART_CNT] = {{1, 0, 1, 0}, {0, 1, 0, 1}};
+        /* The violation scenario leaves p0 unassigned in round 1. */
+        const int round1_violation[C_CNT][PART_CNT] = {{0, 0, 1, 0},
+                                                       {0, 1, 0, 1}};
         /* Three members: p -> p mod 3; p2 (owned by c0, target c2) and p3
          * (owned by c1, target c0) are withheld. */
         const int round2[C_CNT][PART_CNT] = {
@@ -600,19 +662,31 @@ static void do_test(enum mode mode) {
         mcluster = test_mock_cluster_new(1, &bootstraps);
         rd_kafka_mock_topic_create(mcluster, TOPIC, PART_CNT, 1);
         rd_kafka_mock_group_initial_rebalance_delay_ms(mcluster, 0);
+        if (mode == MODE_JOIN_DURING_PENDING ||
+            mode == MODE_CLOSE_DURING_PENDING)
+                rd_kafka_mock_start_request_tracking(mcluster);
 
         test_conf_init(&conf, NULL, 90);
         test_conf_set(conf, "bootstrap.servers", bootstraps);
         test_conf_set(conf, "partition.assignment.strategy", "stream");
         /* test_create_consumer() sets session.timeout.ms to 6000; the mock
          * coordinator waits session.timeout - 1s for a rebalance's members
-         * and evicts a silent member at the session timeout. */
-        test_conf_set(conf, "heartbeat.interval.ms", "500");
+         * and evicts a silent member at the session timeout. The timeout
+         * scenario widens the heartbeat interval so that the library's
+         * give-up, session.timeout.ms - heartbeat.interval.ms after the
+         * JoinGroup response, is two seconds clear of the eviction. */
+        test_conf_set(conf, "heartbeat.interval.ms",
+                      mode == MODE_TIMEOUT ? "2000" : "500");
+        rd_kafka_conf_set_log_cb(conf, log_cb);
 
         for (i = 0; i < C_CNT; i++) {
                 rd_kafka_conf_t *cconf = rd_kafka_conf_dup(conf);
                 rd_snprintf(c[i].name, sizeof(c[i].name), "c%d", i);
                 test_conf_set(cconf, "client.id", c[i].name);
+                if (i == 1)
+                        test_conf_set(cconf, "client.rack", "rack-c1");
+                if (i == 2)
+                        test_conf_set(cconf, "group.instance.id", "gi-c2");
                 rd_kafka_conf_set_assignor(
                     cconf, "stream",
                     mode == MODE_EAGER ? RD_KAFKA_ASSIGNOR_PROTOCOL_EAGER
@@ -621,6 +695,16 @@ static void do_test(enum mode mode) {
                 c[i].rk = test_create_consumer(groupid, NULL, cconf, NULL);
         }
         rd_kafka_conf_destroy(conf);
+
+        /* The scenarios that act on the group under a pending assignment
+         * hold every completion from the start, so that the first
+         * assignment is the held one whatever the thread timing. */
+        if (mode == MODE_CLOSE_DURING_PENDING ||
+            mode == MODE_JOIN_DURING_PENDING || mode == MODE_TIMEOUT) {
+                mtx_lock(&lock);
+                scn.hold_completion = rd_true;
+                mtx_unlock(&lock);
+        }
 
         /* Round 1: two members. */
         for (i = 0; i < 2; i++)
@@ -631,14 +715,18 @@ static void do_test(enum mode mode) {
                  * is pending; the thread completes the stale handle after
                  * that, which must be a no-op. The other member is alone. */
                 int leader;
-                mtx_lock(&lock);
-                scn.hold_completion = rd_true;
-                mtx_unlock(&lock);
                 await_assign_calls(1);
                 leader = leader_index(c, 2);
                 TEST_SAY("closing leader %s under its pending assignment\n",
                          c[leader].name);
                 test_consumer_close(c[leader].rk);
+                /* The close waits for the LeaveGroup response, so the
+                 * coordinator has seen the request by now; without it the
+                 * survivor would wait for the session timeout instead. */
+                TEST_ASSERT(requests_seen(mcluster, RD_KAFKAP_LeaveGroup) == 1,
+                            "expected one LeaveGroup from the closed leader, "
+                            "saw %d",
+                            (int)requests_seen(mcluster, RD_KAFKAP_LeaveGroup));
                 rd_kafka_destroy(c[leader].rk);
                 c[leader].rk = NULL;
                 release_pending_threads();
@@ -659,10 +747,12 @@ static void do_test(enum mode mode) {
                  * the session would expire the library gives it up and
                  * rejoins, before the coordinator evicts the leader, so the
                  * same member leads the next assignment; the late completion
-                 * of the first is dropped. */
-                mtx_lock(&lock);
-                scn.hold_completion = rd_true;
-                mtx_unlock(&lock);
+                 * of the first is dropped. The give-up is 4000 ms after the
+                 * JoinGroup response (6000 - 2000), which precedes the first
+                 * call by a Metadata round trip; a give-up timed from the
+                 * PENDING return would come a second later (the callback's
+                 * sleep), one from the full session timeout two. */
+                int64_t giveup_ms;
                 await_assign_calls(1);
                 await_assign_calls(2);
                 mtx_lock(&lock);
@@ -670,10 +760,12 @@ static void do_test(enum mode mode) {
                             "expected the same leader after the timeout, "
                             "got %s then %s",
                             scn.call_leader[1], scn.call_leader[2]);
-                TEST_ASSERT(scn.call_members[2] >= scn.call_members[1],
-                            "expected call 2 to see at least call 1's %d "
-                            "member(s), saw %d",
-                            scn.call_members[1], scn.call_members[2]);
+                TEST_ASSERT(scn.ts_giveup > 0, "no give-up was logged");
+                giveup_ms = (scn.ts_giveup - scn.call_ts[1]) / 1000;
+                TEST_ASSERT(giveup_ms >= 3500 && giveup_ms < 4500,
+                            "expected the give-up 3500..4500 ms after the "
+                            "first call, saw %" PRId64 " ms",
+                            giveup_ms);
                 mtx_unlock(&lock);
                 release_pending_threads();
                 await_assignments(c, 2, round1, "round 1 after a timeout");
@@ -683,22 +775,40 @@ static void do_test(enum mode mode) {
 
         if (mode == MODE_JOIN_DURING_PENDING) {
                 /* A member joins under the first (held) assignment; once
-                 * released, the coordinator refuses that completion's
-                 * SyncGroup and the leader reassigns for three members. */
-                mtx_lock(&lock);
-                scn.hold_completion = rd_true;
-                mtx_unlock(&lock);
+                 * its JoinGroup has reached the coordinator (the third one:
+                 * each member sends exactly one before the release) and the
+                 * completion is released, the coordinator refuses that
+                 * completion's SyncGroup and the leader reassigns for three
+                 * members. The first assignment is never applied. */
+                int64_t abs_timeout = test_clock() + (15 * 1000 * 1000);
                 await_assign_calls(1);
                 test_consumer_subscribe(c[2].rk, TOPIC);
-                rd_usleep(500 * 1000, NULL);
+                while (requests_seen(mcluster, RD_KAFKAP_JoinGroup) < 3) {
+                        TEST_ASSERT(test_clock() < abs_timeout,
+                                    "timed out waiting for c2's JoinGroup");
+                        rd_usleep(10 * 1000, NULL);
+                }
                 release_pending_threads();
                 await_assignments(c, C_CNT, round3,
                                   "round 1, three members from nothing");
                 check_userdata(c, C_CNT);
+                mtx_lock(&lock);
+                TEST_ASSERT(scn.call_members[2] == 3,
+                            "expected the second assign call to see 3 "
+                            "members, saw %d",
+                            scn.call_members[2]);
+                for (i = 0; i < C_CNT; i++)
+                        TEST_ASSERT(c[i].on_assignment_cnt == 1,
+                                    "%s: %d on_assignment calls, expected "
+                                    "one (the held assignment never applied)",
+                                    c[i].name, c[i].on_assignment_cnt);
+                mtx_unlock(&lock);
                 goto done;
         }
 
-        await_assignments(c, 2, round1, "round 1, two members");
+        await_assignments(c, 2,
+                          mode == MODE_VIOLATION ? round1_violation : round1,
+                          "round 1, two members");
         check_userdata(c, 2);
         mtx_lock(&lock);
         TEST_ASSERT(scn.seen_cnt == 2 && !strcmp(scn.seen[0], "sub:c0") &&
@@ -720,11 +830,6 @@ static void do_test(enum mode mode) {
         TEST_ASSERT(scn.seen_cnt == 3 && !strcmp(scn.seen[2], "none"),
                     "leader saw %d subscription userdata, third \"%s\"",
                     scn.seen_cnt, scn.seen[2]);
-        if (mode == MODE_VIOLATION || mode == MODE_DUPLICATE)
-                TEST_ASSERT(scn.violation_members == 3,
-                            "expected the violating call to see 3 members, "
-                            "saw %d",
-                            scn.violation_members);
         if (mode == MODE_VIOLATION || mode == MODE_DUPLICATE ||
             mode == MODE_FAIL_SYNC || mode == MODE_FAIL_ASYNC)
                 TEST_ASSERT(scn.assign_calls > scn.first_three_member_call,
@@ -832,6 +937,13 @@ static void do_test_conf(void) {
 
 int main_0154_app_assignor_mock(int argc, char **argv) {
         enum mode mode;
+
+        TEST_SKIP_MOCK_CLUSTER(0);
+        if (!test_consumer_group_protocol_classic()) {
+                TEST_SKIP(
+                    "the application assignor is classic protocol only\n");
+                return 0;
+        }
 
         mtx_init(&lock, mtx_plain);
         cnd_init(&cnd);
