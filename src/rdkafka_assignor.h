@@ -205,6 +205,11 @@ struct rd_kafka_assignor_pending_s {
         rd_kafka_t *rk;
         uint64_t id;
         rd_refcnt_t refcnt;
+        mtx_t lock;
+        /** Set by the cgrp when it gives the assignment up: a completion
+         *  after that releases the handle and touches nothing else, so
+         *  that completing after rd_kafka_destroy() is safe. */
+        rd_bool_t abandoned;
         /** The members, moved here from the cgrp's leader state when the
          *  assignment is abandoned while the application still holds the
          *  handle, so that the handle stays valid until it is completed. */
@@ -212,6 +217,7 @@ struct rd_kafka_assignor_pending_s {
         int member_cnt;
 };
 
+void rd_kafka_assignor_pending_abandon(rd_kafka_assignor_pending_t *pending);
 void rd_kafka_assignor_pending_destroy(rd_kafka_assignor_pending_t *pending);
 rd_bool_t rd_kafka_assignor_cooperative_check(rd_kafka_group_member_t *members,
                                               int member_cnt,

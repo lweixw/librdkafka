@@ -2973,6 +2973,7 @@ void rd_kafka_conf_set_assignor(
     rd_kafka_assignor_assign_cb_t assign_cb,
     rd_kafka_assignor_on_assignment_cb_t on_assignment_cb,
     void *opaque) {
+        rd_assert(protocol_name && assign_cb);
         RD_IF_FREE(conf->app_assignor.protocol_name, rd_free);
         conf->app_assignor.protocol_name    = rd_strdup(protocol_name);
         conf->app_assignor.protocol         = protocol;

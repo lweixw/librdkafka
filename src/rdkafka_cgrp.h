@@ -203,7 +203,10 @@ typedef struct rd_kafka_cgrp_s {
                                              *   when none; a completion for
                                              *   any other one is stale. */
         uint64_t rkcg_assignor_pending_seq; /**< Ids the pending assignments
-                                             *   are numbered with (logs). */
+                                             *   are numbered with. */
+        rd_kafka_timer_t rkcg_assignor_pending_tmr; /**< Bounds a pending
+                                                     *   assignment by
+                                                     *   session.timeout.ms */
 
         int32_t rkcg_coord_id; /**< Current coordinator id,
                                 *   or -1 if not known. */

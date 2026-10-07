@@ -1837,7 +1837,7 @@ rd_kafka_app_assignor_get_metadata(const rd_kafka_assignor_t *rkas,
         size_t userdata_size = 0;
         rd_kafkap_bytes_t *metadata;
         int topic_cnt = rd_list_cnt(topics);
-        const char **names = rd_malloc(sizeof(*names) * (topic_cnt + 1));
+        const char **names = rd_malloc(sizeof(*names) * (topic_cnt > 0 ? topic_cnt : 1));
         const rd_kafka_topic_info_t *tinfo;
         int i;
 
@@ -1858,6 +1858,17 @@ rd_kafka_app_assignor_get_metadata(const rd_kafka_assignor_t *rkas,
         rd_free(names);
 
         return metadata;
+}
+
+static void rd_kafka_assignor_pending_free(rd_kafka_assignor_pending_t *pending) {
+        int i;
+
+        for (i = 0; i < pending->member_cnt; i++)
+                rd_kafka_group_member_clear(&pending->members[i]);
+        RD_IF_FREE(pending->members, rd_free);
+        mtx_destroy(&pending->lock);
+        rd_refcnt_destroy(&pending->refcnt);
+        rd_free(pending);
 }
 
 static rd_kafka_resp_err_t
@@ -1895,6 +1906,7 @@ rd_kafka_app_assignor_assign(rd_kafka_t *rk,
         pending->id = ++rkcg->rkcg_assignor_pending_seq;
         /* One reference for the cgrp, one for the application. */
         rd_refcnt_init(&pending->refcnt, 2);
+        mtx_init(&pending->lock, mtx_plain);
 
         res = rd_kafka_app_assignor(rk)->assign_cb(
             rk, member_id, metadata, (rd_kafka_assignor_member_t *)members,
@@ -1909,11 +1921,11 @@ rd_kafka_app_assignor_assign(rd_kafka_t *rk,
                 return RD_KAFKA_RESP_ERR__IN_PROGRESS;
 
         case RD_KAFKA_ASSIGNOR_DONE:
-                rd_free(pending);
+                rd_kafka_assignor_pending_free(pending);
                 return RD_KAFKA_RESP_ERR_NO_ERROR;
 
         default:
-                rd_free(pending);
+                rd_kafka_assignor_pending_free(pending);
                 if (!*errstr)
                         rd_snprintf(errstr, errstr_size,
                                     "application assignor failed");
@@ -1971,6 +1983,68 @@ rd_kafka_resp_err_t rd_kafka_app_assignor_init(rd_kafka_t *rk) {
  *        assignment may not revoke a partition from one member and add it
  *        to another in the same rebalance; the assignor withholds it instead.
  */
+/**
+ * @brief Sorted copy of \p src (an empty list for NULL).
+ */
+static rd_kafka_topic_partition_list_t *
+rd_kafka_assignor_sorted_copy(const rd_kafka_topic_partition_list_t *src) {
+        rd_kafka_topic_partition_list_t *copy =
+            src ? rd_kafka_topic_partition_list_copy(src)
+                : rd_kafka_topic_partition_list_new(0);
+        rd_kafka_topic_partition_list_sort(copy, NULL, NULL);
+        return copy;
+}
+
+/**
+ * @brief Walks the sorted lists \p a and \p b together and appends to
+ *        \p a_only the elements of \p a that \p b lacks.
+ */
+static void
+rd_kafka_assignor_sorted_diff(const rd_kafka_topic_partition_list_t *a,
+                              const rd_kafka_topic_partition_list_t *b,
+                              rd_kafka_topic_partition_list_t *a_only) {
+        int ia = 0, ib = 0;
+
+        while (ia < a->cnt) {
+                int r = ib < b->cnt ? rd_kafka_topic_partition_cmp(
+                                          &a->elems[ia], &b->elems[ib])
+                                    : -1;
+                if (r < 0) {
+                        rd_kafka_topic_partition_list_add(
+                            a_only, a->elems[ia].topic,
+                            a->elems[ia].partition);
+                        ia++;
+                } else if (r == 0) {
+                        ia++;
+                        ib++;
+                } else
+                        ib++;
+        }
+}
+
+/**
+ * @returns the first element of the sorted list that repeats its
+ *          predecessor, or NULL.
+ */
+static const rd_kafka_topic_partition_t *
+rd_kafka_assignor_sorted_dup(const rd_kafka_topic_partition_list_t *list) {
+        int i;
+        for (i = 1; i < list->cnt; i++)
+                if (!rd_kafka_topic_partition_cmp(&list->elems[i - 1],
+                                                  &list->elems[i]))
+                        return &list->elems[i];
+        return NULL;
+}
+
+/**
+ * @brief Java's ConsumerCoordinator.validateCooperativeAssignment: an
+ *        assignment may not revoke a partition from one member and add it
+ *        to another in the same rebalance; the assignor withholds it instead.
+ *        Also refused, since no adjustment follows that would repair them:
+ *        a partition assigned twice, within one member or across members.
+ *
+ * O(P log P) over the members' partitions, on the main thread.
+ */
 rd_bool_t rd_kafka_assignor_cooperative_check(rd_kafka_group_member_t *members,
                                               int member_cnt,
                                               char *errstr,
@@ -1979,52 +2053,66 @@ rd_bool_t rd_kafka_assignor_cooperative_check(rd_kafka_group_member_t *members,
             rd_kafka_topic_partition_list_new(0);
         rd_kafka_topic_partition_list_t *revoked =
             rd_kafka_topic_partition_list_new(0);
+        rd_kafka_topic_partition_list_t *all_assigned =
+            rd_kafka_topic_partition_list_new(0);
+        const rd_kafka_topic_partition_t *dup;
         rd_bool_t ok = rd_true;
-        int i, j;
+        int i, ia, ir;
 
         for (i = 0; i < member_cnt; i++) {
-                const rd_kafka_group_member_t *rkgm = &members[i];
-                const rd_kafka_topic_partition_list_t *owned =
-                    rkgm->rkgm_owned;
-                const rd_kafka_topic_partition_list_t *assigned =
-                    rkgm->rkgm_assignment;
+                rd_kafka_topic_partition_list_t *owned =
+                    rd_kafka_assignor_sorted_copy(members[i].rkgm_owned);
+                rd_kafka_topic_partition_list_t *assigned =
+                    rd_kafka_assignor_sorted_copy(members[i].rkgm_assignment);
+                int j;
 
-                for (j = 0; assigned && j < assigned->cnt; j++) {
-                        const rd_kafka_topic_partition_t *p =
-                            &assigned->elems[j];
-                        if (!owned || !rd_kafka_topic_partition_list_find(
-                                          owned, p->topic, p->partition))
-                                rd_kafka_topic_partition_list_add(
-                                    added, p->topic, p->partition);
-                }
-                for (j = 0; owned && j < owned->cnt; j++) {
-                        const rd_kafka_topic_partition_t *p =
-                            &owned->elems[j];
-                        if (!assigned || !rd_kafka_topic_partition_list_find(
-                                             assigned, p->topic, p->partition))
-                                rd_kafka_topic_partition_list_add(
-                                    revoked, p->topic, p->partition);
-                }
+                rd_kafka_assignor_sorted_diff(assigned, owned, added);
+                rd_kafka_assignor_sorted_diff(owned, assigned, revoked);
+                for (j = 0; j < assigned->cnt; j++)
+                        rd_kafka_topic_partition_list_add(
+                            all_assigned, assigned->elems[j].topic,
+                            assigned->elems[j].partition);
+
+                rd_kafka_topic_partition_list_destroy(owned);
+                rd_kafka_topic_partition_list_destroy(assigned);
         }
 
-        for (i = 0; i < added->cnt; i++) {
-                const rd_kafka_topic_partition_t *p = &added->elems[i];
-                if (rd_kafka_topic_partition_list_find(revoked, p->topic,
-                                                       p->partition)) {
+        rd_kafka_topic_partition_list_sort(all_assigned, NULL, NULL);
+        if ((dup = rd_kafka_assignor_sorted_dup(all_assigned))) {
+                rd_snprintf(errstr, errstr_size,
+                            "application assignor assigned %s [%" PRId32
+                            "] more than once",
+                            dup->topic, dup->partition);
+                ok = rd_false;
+                goto done;
+        }
+
+        rd_kafka_topic_partition_list_sort(added, NULL, NULL);
+        rd_kafka_topic_partition_list_sort(revoked, NULL, NULL);
+        for (ia = 0, ir = 0; ia < added->cnt && ir < revoked->cnt;) {
+                int r = rd_kafka_topic_partition_cmp(&added->elems[ia],
+                                                     &revoked->elems[ir]);
+                if (r == 0) {
                         rd_snprintf(errstr, errstr_size,
                                     "application assignor violates the "
                                     "cooperative protocol: %s [%" PRId32
                                     "] is revoked from one member and "
                                     "assigned to another in the same "
                                     "rebalance",
-                                    p->topic, p->partition);
+                                    added->elems[ia].topic,
+                                    added->elems[ia].partition);
                         ok = rd_false;
                         break;
-                }
+                } else if (r < 0)
+                        ia++;
+                else
+                        ir++;
         }
 
+done:
         rd_kafka_topic_partition_list_destroy(added);
         rd_kafka_topic_partition_list_destroy(revoked);
+        rd_kafka_topic_partition_list_destroy(all_assigned);
         return ok;
 }
 
@@ -2054,6 +2142,7 @@ void rd_kafka_conf_app_assignor_copy(int scope,
         rd_kafka_conf_t *dconf       = pdst;
         const rd_kafka_conf_t *sconf = psrc;
         rd_assert(scope == _RK_GLOBAL);
+        RD_IF_FREE(dconf->app_assignor.protocol_name, rd_free);
         dconf->app_assignor = sconf->app_assignor;
         if (sconf->app_assignor.protocol_name)
                 dconf->app_assignor.protocol_name =
@@ -2079,14 +2168,18 @@ const char *rd_kafka_assignor_member_group_instance_id(
     const rd_kafka_assignor_member_t *member) {
         const rd_kafkap_str_t *s =
             rd_kafka_assignor_member_int(member)->rkgm_group_instance_id;
-        return s && !RD_KAFKAP_STR_IS_NULL(s) ? s->str : NULL;
+        return s && !RD_KAFKAP_STR_IS_NULL(s) && RD_KAFKAP_STR_LEN(s) > 0
+                   ? s->str
+                   : NULL;
 }
 
 const char *
 rd_kafka_assignor_member_rack_id(const rd_kafka_assignor_member_t *member) {
         const rd_kafkap_str_t *s =
             rd_kafka_assignor_member_int(member)->rkgm_rack_id;
-        return s && !RD_KAFKAP_STR_IS_NULL(s) ? s->str : NULL;
+        return s && !RD_KAFKAP_STR_IS_NULL(s) && RD_KAFKAP_STR_LEN(s) > 0
+                   ? s->str
+                   : NULL;
 }
 
 const rd_kafka_topic_partition_list_t *rd_kafka_assignor_member_subscription(
@@ -2128,6 +2221,7 @@ void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
                                            const void *userdata,
                                            size_t size) {
         rd_kafka_group_member_t *rkgm = rd_kafka_assignor_member_int(member);
+        rd_assert(size <= INT32_MAX);
         if (rkgm->rkgm_userdata)
                 rd_kafkap_bytes_destroy(rkgm->rkgm_userdata);
         rkgm->rkgm_userdata =
@@ -2136,34 +2230,40 @@ void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
                 : NULL;
 }
 
-void rd_kafka_assignor_pending_destroy(rd_kafka_assignor_pending_t *pending) {
-        int i;
+void rd_kafka_assignor_pending_abandon(rd_kafka_assignor_pending_t *pending) {
+        mtx_lock(&pending->lock);
+        pending->abandoned = rd_true;
+        mtx_unlock(&pending->lock);
+}
 
+void rd_kafka_assignor_pending_destroy(rd_kafka_assignor_pending_t *pending) {
         if (rd_refcnt_sub(&pending->refcnt) > 0)
                 return;
-
-        for (i = 0; i < pending->member_cnt; i++)
-                rd_kafka_group_member_clear(&pending->members[i]);
-        RD_IF_FREE(pending->members, rd_free);
-        rd_free(pending);
+        rd_kafka_assignor_pending_free(pending);
 }
 
 void rd_kafka_assignor_complete(rd_kafka_assignor_pending_t *pending,
                                 rd_kafka_resp_err_t err,
                                 const char *errstr) {
-        rd_kafka_t *rk = pending->rk;
-        rd_kafka_op_t *rko =
-            rd_kafka_op_new_cb(rk, RD_KAFKA_OP_ASSIGNOR_COMPLETE,
-                               rd_kafka_cgrp_assignor_complete_op);
+        /* The cgrp abandons the pending (under its lock) before the client
+         * can go away, so an abandoned pending touches nothing but itself. */
+        mtx_lock(&pending->lock);
+        if (!pending->abandoned) {
+                rd_kafka_t *rk    = pending->rk;
+                rd_kafka_op_t *rko = rd_kafka_op_new_cb(
+                    rk, RD_KAFKA_OP_ASSIGNOR_COMPLETE,
+                    rd_kafka_cgrp_assignor_complete_op);
 
-        rko->rko_u.assignor_complete.pending = pending;
-        rko->rko_u.assignor_complete.err     = err;
-        rko->rko_u.assignor_complete.errstr = errstr ? rd_strdup(errstr) : NULL;
+                rko->rko_u.assignor_complete.id  = pending->id;
+                rko->rko_u.assignor_complete.err = err;
+                rko->rko_u.assignor_complete.errstr =
+                    errstr ? rd_strdup(errstr) : NULL;
 
-        rd_kafka_q_enq(rk->rk_cgrp->rkcg_ops, rko);
+                rd_kafka_q_enq(rk->rk_cgrp->rkcg_ops, rko);
+        }
+        mtx_unlock(&pending->lock);
 
-        /* The application's reference; the members outlive it only while
-         * the cgrp still holds its own. */
+        /* The application's reference. */
         rd_kafka_assignor_pending_destroy(pending);
 }
 
