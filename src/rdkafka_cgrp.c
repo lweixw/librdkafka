@@ -66,6 +66,8 @@ static rd_kafka_op_res_t rd_kafka_cgrp_op_serve(rd_kafka_t *rk,
 
 static void rd_kafka_cgrp_group_leader_reset(rd_kafka_cgrp_t *rkcg,
                                              const char *reason);
+static void rd_kafka_cgrp_assignor_pending_tmr_cb(rd_kafka_timers_t *rkts,
+                                                  void *arg);
 
 static RD_INLINE int rd_kafka_cgrp_try_terminate(rd_kafka_cgrp_t *rkcg);
 
@@ -405,9 +407,53 @@ rd_kafka_cgrp_maybe_clear_heartbeat_failed_err(rd_kafka_cgrp_t *rkcg) {
 }
 
 
+/**
+ * @brief Give up the application assignor's pending assignment: the members
+ *        go to the pending (the application may still be writing into them
+ *        through its handle) and the cgrp's reference is dropped.
+ *
+ * @locality rdkafka main thread
+ */
+static void rd_kafka_cgrp_assignor_pending_abandon(rd_kafka_cgrp_t *rkcg,
+                                                   const char *reason) {
+        rd_kafka_assignor_pending_t *pending = rkcg->rkcg_assignor_pending;
+
+        if (!pending)
+                return;
+
+        rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "ASSIGNOR",
+                     "Group \"%.*s\": pending assignment %" PRIu64
+                     " abandoned: %s",
+                     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), pending->id,
+                     reason);
+
+        rd_kafka_timer_stop(&rkcg->rkcg_rk->rk_timers,
+                            &rkcg->rkcg_assignor_pending_tmr, 1 /*lock*/);
+
+        rd_assert(!pending->members);
+        pending->members    = rkcg->rkcg_group_leader.members;
+        pending->member_cnt = rkcg->rkcg_group_leader.member_cnt;
+        rkcg->rkcg_group_leader.members    = NULL;
+        rkcg->rkcg_group_leader.member_cnt = 0;
+        rkcg->rkcg_assignor_pending        = NULL;
+
+        rd_kafka_assignor_pending_abandon(pending);
+        rd_kafka_assignor_pending_destroy(pending);
+}
+
+
 void rd_kafka_cgrp_set_join_state(rd_kafka_cgrp_t *rkcg, int join_state) {
         if ((int)rkcg->rkcg_join_state == join_state)
                 return;
+
+        /* Any way out of wait-assign-complete but the completion itself
+         * (which clears the pending before moving to wait-sync) gives the
+         * pending assignment up: a rejoin, a leave, a protocol change. */
+        if (rkcg->rkcg_join_state ==
+                RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE &&
+            join_state != RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC)
+                rd_kafka_cgrp_assignor_pending_abandon(
+                    rkcg, rd_kafka_cgrp_join_state_names[join_state]);
 
         if (rkcg->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_INIT ||
             rkcg->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_STEADY) {
@@ -2144,7 +2190,7 @@ static void rd_kafka_cgrp_assignor_finish(rd_kafka_cgrp_t *rkcg,
         rd_kafka_SyncGroupRequest(
             rkcg->rkcg_coord, rkcg->rkcg_group_id, rkcg->rkcg_generation_id,
             rkcg->rkcg_member_id, rkcg->rkcg_group_instance_id, members,
-            member_cnt, RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
+            err ? 0 : member_cnt, RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
             rd_kafka_cgrp_handle_SyncGroup, rkcg);
         return;
 
@@ -2189,7 +2235,15 @@ static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
         if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS) {
                 /* The application assignor completes later through
                  * rd_kafka_assignor_complete(); the members stay on
-                 * rkcg_group_leader until then. */
+                 * rkcg_group_leader until then. The followers' SyncGroup
+                 * waits session.timeout.ms for the assignment, so that is
+                 * the bound, enforced here with a rejoin. */
+                rd_kafka_timer_start_oneshot(
+                    &rkcg->rkcg_rk->rk_timers,
+                    &rkcg->rkcg_assignor_pending_tmr, rd_true /*restart*/,
+                    (rd_ts_t)rkcg->rkcg_rk->rk_conf.group_session_timeout_ms *
+                        1000,
+                    rd_kafka_cgrp_assignor_pending_tmr_cb, rkcg);
                 rd_kafka_dbg(rkcg->rkcg_rk, CGRP | RD_KAFKA_DBG_CONSUMER,
                              "ASSIGNOR",
                              "Group \"%s\": \"%s\" assignor left the "
@@ -2209,6 +2263,31 @@ static void rd_kafka_cgrp_assignor_run(rd_kafka_cgrp_t *rkcg,
 
 
 /**
+ * @brief The application assignor did not complete within
+ *        session.timeout.ms: give the assignment up and rejoin.
+ */
+static void rd_kafka_cgrp_assignor_pending_tmr_cb(rd_kafka_timers_t *rkts,
+                                                  void *arg) {
+        rd_kafka_cgrp_t *rkcg = arg;
+
+        if (rkcg->rkcg_join_state !=
+            RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE)
+                return;
+
+        rd_kafka_log(rkcg->rkcg_rk, LOG_WARNING, "ASSIGNOR",
+                     "Group \"%s\": application assignor did not complete "
+                     "the assignment within session.timeout.ms (%dms): "
+                     "rejoining group",
+                     rkcg->rkcg_group_id->str,
+                     rkcg->rkcg_rk->rk_conf.group_session_timeout_ms);
+
+        rd_kafka_cgrp_rejoin(rkcg,
+                             "application assignor did not complete within "
+                             "session.timeout.ms");
+}
+
+
+/**
  * @brief Op callback from rd_kafka_assignor_complete(): the application
  *        finished a pending assignment.
  *
@@ -2223,17 +2302,18 @@ rd_kafka_op_res_t rd_kafka_cgrp_assignor_complete_op(rd_kafka_t *rk,
         if (rko->rko_err == RD_KAFKA_RESP_ERR__DESTROY)
                 return RD_KAFKA_OP_RES_HANDLED; /* Terminating */
 
-        /* The op's pointer is only compared: the pending it names may be
-         * gone if the group abandoned it and the application released it. */
         if (rkcg->rkcg_join_state !=
                 RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_COMPLETE ||
-            rko->rko_u.assignor_complete.pending !=
-                rkcg->rkcg_assignor_pending ||
+            !rkcg->rkcg_assignor_pending ||
+            rko->rko_u.assignor_complete.id !=
+                rkcg->rkcg_assignor_pending->id ||
             !rkcg->rkcg_group_leader.members) {
                 rd_kafka_dbg(rk, CGRP, "ASSIGNOR",
                              "Group \"%s\": dropping stale assignor "
-                             "completion in state %s (pending %" PRIu64 ")",
+                             "completion %" PRIu64 " in state %s (pending %" PRIu64
+                             ")",
                              rkcg->rkcg_group_id->str,
+                             rko->rko_u.assignor_complete.id,
                              rd_kafka_cgrp_join_state_names
                                  [rkcg->rkcg_join_state],
                              rkcg->rkcg_assignor_pending
@@ -2242,8 +2322,11 @@ rd_kafka_op_res_t rd_kafka_cgrp_assignor_complete_op(rd_kafka_t *rk,
                 return RD_KAFKA_OP_RES_HANDLED;
         }
 
-        pending                      = rkcg->rkcg_assignor_pending;
-        rkcg->rkcg_assignor_pending  = NULL;
+        rd_kafka_timer_stop(&rk->rk_timers, &rkcg->rkcg_assignor_pending_tmr,
+                            1 /*lock*/);
+
+        pending                     = rkcg->rkcg_assignor_pending;
+        rkcg->rkcg_assignor_pending = NULL;
 
         rd_kafka_cgrp_assignor_finish(
             rkcg, rkcg->rkcg_assignor, rko->rko_u.assignor_complete.err,
@@ -5616,25 +5699,7 @@ static void rd_kafka_cgrp_group_leader_reset(rd_kafka_cgrp_t *rkcg,
                      "Group \"%.*s\": resetting group leader info: %s",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), reason);
 
-        if (rkcg->rkcg_assignor_pending) {
-                /* The application may still be writing into the members
-                 * through its handle: hand them to the pending, which frees
-                 * them with its last reference. */
-                rd_kafka_assignor_pending_t *pending =
-                    rkcg->rkcg_assignor_pending;
-                rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "GRPLEADER",
-                             "Group \"%.*s\": pending assignment %" PRIu64
-                             " abandoned: %s",
-                             RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), pending->id,
-                             reason);
-                rd_assert(!pending->members);
-                pending->members    = rkcg->rkcg_group_leader.members;
-                pending->member_cnt = rkcg->rkcg_group_leader.member_cnt;
-                rkcg->rkcg_group_leader.members    = NULL;
-                rkcg->rkcg_group_leader.member_cnt = 0;
-                rkcg->rkcg_assignor_pending        = NULL;
-                rd_kafka_assignor_pending_destroy(pending);
-        }
+        rd_kafka_cgrp_assignor_pending_abandon(rkcg, reason);
 
         if (rkcg->rkcg_group_leader.members) {
                 int i;

@@ -917,10 +917,9 @@ struct rd_kafka_op_s {
                 } share_ack_commit_cb_register;
 
                 struct {
-                        /** The pending assignment this completes, compared
-                         *  (never dereferenced) against the cgrp's current
-                         *  one. */
-                        struct rd_kafka_assignor_pending_s *pending;
+                        /** Id of the pending assignment this completes,
+                         *  matched against the cgrp's current one. */
+                        uint64_t id;
                         /** The assignor's result. */
                         rd_kafka_resp_err_t err;
                         /** Allocated reason, or NULL. */
