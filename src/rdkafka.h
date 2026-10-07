@@ -2213,9 +2213,11 @@ void rd_kafka_conf_set_rebalance_cb(
  * (rd_kafka_assignment(), rd_kafka_memberid(), rd_kafka_committed(), ...).
  * An \p assign_cb that needs to wait for anything returns
  * RD_KAFKA_ASSIGNOR_PENDING and finishes the assignment later with
- * rd_kafka_assignor_complete() from any thread, within `session.timeout.ms`
- * (the other members' SyncGroup waits that long; after it the library gives
- * the assignment up and rejoins).
+ * rd_kafka_assignor_complete() from any thread. No heartbeat is sent while
+ * the assignment is pending, so it must complete within `session.timeout.ms`
+ * of the JoinGroup response (the other members' SyncGroup waits that long
+ * too); a heartbeat interval before that the library gives the assignment up
+ * and rejoins.
  *
  * Under the COOPERATIVE protocol the post-assignment adjustment the built-in
  * assignors rely on is not applied to an application assignor: the assignor
@@ -2417,7 +2419,8 @@ void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
  * unsubscribed, picked another assignor, gave the assignment up at
  * `session.timeout.ms` or was destroyed is dropped: the handle is released
  * and nothing else is touched, so completing after rd_kafka_destroy() is
- * safe. A handle that is never completed leaks it.
+ * safe. A handle that is never completed leaks the handle and the members it
+ * holds.
  *
  * @param pending The handle from the assign callback.
  * @param err RD_KAFKA_RESP_ERR_NO_ERROR, or why the assignment failed.

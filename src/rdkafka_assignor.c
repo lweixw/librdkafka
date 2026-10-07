@@ -1993,11 +1993,6 @@ rd_kafka_resp_err_t rd_kafka_app_assignor_init(rd_kafka_t *rk) {
 }
 
 /**
- * @brief Java's ConsumerCoordinator.validateCooperativeAssignment: an
- *        assignment may not revoke a partition from one member and add it
- *        to another in the same rebalance; the assignor withholds it instead.
- */
-/**
  * @brief Sorted copy of \p src (an empty list for NULL).
  */
 static rd_kafka_topic_partition_list_t *
@@ -2235,7 +2230,7 @@ void rd_kafka_assignor_member_set_userdata(rd_kafka_assignor_member_t *member,
                                            const void *userdata,
                                            size_t size) {
         rd_kafka_group_member_t *rkgm = rd_kafka_assignor_member_int(member);
-        rd_assert(size <= INT32_MAX);
+        rd_kafka_assert(NULL, size <= INT32_MAX);
         if (rkgm->rkgm_userdata)
                 rd_kafkap_bytes_destroy(rkgm->rkgm_userdata);
         rkgm->rkgm_userdata =
