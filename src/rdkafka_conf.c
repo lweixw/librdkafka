@@ -1293,6 +1293,16 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
      .dtor = rd_kafka_conf_interceptor_dtor,
      .copy = rd_kafka_conf_interceptor_copy},
 
+    /* The application assignor is registered through
+     * rd_kafka_conf_set_assignor() and selected by name through
+     * partition.assignment.strategy. */
+    {_RK_GLOBAL | _RK_CONSUMER, "assignor", _RK_C_INTERNAL, _RK(app_assignor),
+     "Application partition assignor registered through "
+     "rd_kafka_conf_set_assignor().",
+     .ctor = rd_kafka_conf_app_assignor_ctor,
+     .dtor = rd_kafka_conf_app_assignor_dtor,
+     .copy = rd_kafka_conf_app_assignor_copy},
+
     /* Test mocks. */
     {_RK_GLOBAL | _RK_HIDDEN, "test.mock.num.brokers", _RK_C_INT,
      _RK(mock.broker_cnt),
@@ -3028,6 +3038,24 @@ void rd_kafka_conf_set_rebalance_cb(
                          void *opaque)) {
         rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf, "rebalance_cb",
                                       rebalance_cb);
+}
+
+void rd_kafka_conf_set_assignor(
+    rd_kafka_conf_t *conf,
+    const char *protocol_name,
+    rd_kafka_assignor_protocol_t protocol,
+    rd_kafka_assignor_subscription_cb_t subscription_cb,
+    rd_kafka_assignor_assign_cb_t assign_cb,
+    rd_kafka_assignor_on_assignment_cb_t on_assignment_cb,
+    void *opaque) {
+        rd_kafka_assert(NULL, protocol_name && assign_cb);
+        RD_IF_FREE(conf->app_assignor.protocol_name, rd_free);
+        conf->app_assignor.protocol_name    = rd_strdup(protocol_name);
+        conf->app_assignor.protocol         = protocol;
+        conf->app_assignor.subscription_cb  = subscription_cb;
+        conf->app_assignor.assign_cb        = assign_cb;
+        conf->app_assignor.on_assignment_cb = on_assignment_cb;
+        conf->app_assignor.opaque           = opaque;
 }
 
 void rd_kafka_conf_set_offset_commit_cb(

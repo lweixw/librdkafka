@@ -64,8 +64,13 @@ typedef struct rd_kafka_group_member_s {
         rd_kafkap_str_t *rkgm_member_id;
         /** Group instance id. */
         rd_kafkap_str_t *rkgm_group_instance_id;
-        /** Member-specific opaque userdata. */
+        /** Member-specific opaque userdata: the subscription's on the way
+         *  into the assignor, the assignment's on the way out. */
         rd_kafkap_bytes_t *rkgm_userdata;
+        /** Where an application assignor's trampoline moves the
+         *  subscription userdata before the application runs, so that an
+         *  untouched member sends no userdata rather than its own back. */
+        rd_kafkap_bytes_t *rkgm_subscription_userdata;
         /** Member metadata, e.g., the currently owned partitions. */
         rd_kafkap_bytes_t *rkgm_member_metadata;
         /** Group generation id. */
@@ -100,6 +105,11 @@ typedef struct rd_kafka_assignor_s {
         rd_kafkap_str_t *rkas_protocol_name;
 
         int rkas_enabled;
+
+        /** Registered by the application through
+         *  rd_kafka_conf_set_assignor(): no cooperative adjustment after
+         *  its assign callback, the cooperative rule is checked instead. */
+        int rkas_app;
 
         /** Order for strategies. */
         int rkas_index;
@@ -172,6 +182,48 @@ rd_kafka_resp_err_t rd_kafka_assignor_add(
     void (*destroy_state_cb)(void *assignor_state),
     int (*unittest_cb)(void),
     void *opaque);
+
+/* Application assignor (rd_kafka_conf_set_assignor()). */
+void rd_kafka_conf_app_assignor_ctor(int scope, void *pconf);
+void rd_kafka_conf_app_assignor_dtor(int scope, void *pconf);
+void rd_kafka_conf_app_assignor_copy(int scope,
+                                     void *pdst,
+                                     const void *psrc,
+                                     void *dstptr,
+                                     const void *srcptr,
+                                     size_t filter_cnt,
+                                     const char **filter);
+rd_kafka_resp_err_t
+rd_kafka_app_assignor_init(rd_kafka_t *rk, char *errstr, size_t errstr_size);
+
+/**
+ * A pending application assignment, shared by the cgrp (on
+ * rkcg_assignor_pending until it finishes or abandons the assignment) and
+ * the application (until rd_kafka_assignor_complete()); freed with the last
+ * reference.
+ */
+struct rd_kafka_assignor_pending_s {
+        rd_kafka_t *rk;
+        uint64_t id;
+        rd_refcnt_t refcnt;
+        mtx_t lock;
+        /** Set by the cgrp when it gives the assignment up: a completion
+         *  after that releases the handle and touches nothing else, so
+         *  that completing after rd_kafka_destroy() is safe. */
+        rd_bool_t abandoned;
+        /** The members, moved here from the cgrp's leader state when the
+         *  assignment is abandoned while the application still holds the
+         *  handle, so that the handle stays valid until it is completed. */
+        rd_kafka_group_member_t *members;
+        int member_cnt;
+};
+
+void rd_kafka_assignor_pending_abandon(rd_kafka_assignor_pending_t *pending);
+void rd_kafka_assignor_pending_destroy(rd_kafka_assignor_pending_t *pending);
+rd_bool_t rd_kafka_assignor_cooperative_check(rd_kafka_group_member_t *members,
+                                              int member_cnt,
+                                              char *errstr,
+                                              size_t errstr_size);
 
 rd_kafkap_bytes_t *rd_kafka_consumer_protocol_member_metadata_new(
     const rd_list_t *topics,
